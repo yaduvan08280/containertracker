@@ -1,0 +1,1292 @@
+<script>
+/* Container Tracker — browser app.
+ * Renders instantly from a localStorage snapshot, then asks the server only for what changed.
+ * Saves are optimistic: the screen updates first, the server confirms in the background. */
+(function () {
+'use strict';
+
+/* ================================================================ utils */
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const isEmpty = v => v === undefined || v === null || v === '';
+const pad = n => String(n).padStart(2, '0');
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const LS = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+function fmtD(ms) { if (!ms) return '—'; const d = new Date(+ms); return pad(d.getDate()) + ' ' + MON[d.getMonth()] + ' ' + d.getFullYear(); }
+function fmtDT(ms) { if (!ms) return '—'; const d = new Date(+ms); return fmtD(ms) + ', ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+function fmtShort(ms) { const d = new Date(+ms); return pad(d.getDate()) + ' ' + MON[d.getMonth()] + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+function human(ms) {
+  ms = Math.abs(ms); const m = Math.round(ms / 6e4);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + 'h' + (h < 10 && m % 60 ? ' ' + (m % 60) + 'm' : '');
+  return Math.floor(h / 24) + 'd' + (h % 24 ? ' ' + (h % 24) + 'h' : '');
+}
+function money(v) { return '₹ ' + Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 }); }
+function toInput(ms, t) {
+  if (isEmpty(ms)) return '';
+  const d = new Date(+ms), ds = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  return t === 'date' ? ds : ds + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+function fromInput(v, t) {
+  if (!v) return '';
+  if (t === 'date') { const p = v.split('-').map(Number); return new Date(p[0], p[1] - 1, p[2]).getTime(); }
+  return new Date(v).getTime();
+}
+function dayStart(v) { if (!v) return 0; const p = v.split('-').map(Number); return new Date(p[0], p[1] - 1, p[2]).getTime(); }
+function fmtV(k, v) {
+  if (isEmpty(v)) return '';
+  const f = DEF.fields[k] || {};
+  if (f.t === 'date') return fmtD(v);
+  if (f.t === 'datetime') return fmtDT(v);
+  if (f.t === 'money') return money(v);
+  return String(v);
+}
+function valHtml(k, v) {
+  if (isEmpty(v)) return '<span class="e">—</span>';
+  const f = DEF.fields[k] || {};
+  if (f.t === 'file' || /^https?:\/\//.test(String(v))) return '<a href="' + esc(v) + '" target="_blank" rel="noopener">View file ↗</a>';
+  return esc(fmtV(k, v));
+}
+function driveId(url) { const m = String(url).match(/\/d\/([\w-]{20,})/) || String(url).match(/[?&]id=([\w-]{20,})/); return m ? m[1] : ''; }
+function thumb(url) {
+  const id = driveId(url);
+  return id ? '<img data-th="1" loading="lazy" src="https://drive.google.com/thumbnail?id=' + id + '&sz=w120" alt="">' : '<span class="fi">🔗</span>';
+}
+
+const ICON = {
+  dash: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>',
+  list: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="12" rx="1.5"/><path d="M6 7v12M10 7v12M14 7v12M18 7v12M7 4h10"/></svg>',
+  appr: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg>',
+  rem: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>',
+  chart: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>',
+  admin: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6"/><path d="M19 8v6M16 11h6"/></svg>'
+};
+
+/* ================================================================ state */
+const S = {
+  token: LS.get('ct_token'), me: null, users: [], rules: {}, settings: {}, C: new Map(), approvals: [], url: '',
+  since: 0, view: LS.get('ct_view') || 'dash', q: '', qTerms: [],
+  lf: Object.assign({ tab: 'ACTIVE', from: '', to: '', step: '', group: false, sort: 'new' }, LS.get('ct_lf') || {}),
+  limit: 120, open: null, dtab: 'pipe', edit: null, dirty: false, stash: {}, uploading: {}, hist: {}, histBusy: {},
+  adm: null, atab: 'users', rems: null, charts: [], an: { preset: 'month', from: '', to: '' }, visits: null
+};
+const isAdmin = () => S.me && S.me.role === 'admin';
+const isPC = () => S.me && (S.me.role === 'pc' || S.me.role === 'admin');
+const can = k => !!S.me && (isAdmin() || (S.me.steps || []).indexOf(k) >= 0);
+const editable = c => c.status === 'ACTIVE' || isAdmin();
+const assignees = k => S.users.filter(u => u.active && (u.steps || []).indexOf(k) >= 0);
+const callee = u => '<span class="callee">' + esc(u.name) + (u.mobile ? ' · <a href="tel:' + esc(u.mobile) + '">' + esc(u.mobile) + '</a>' : '') + '</span>';
+const st = c => ctState(c, S.rules, Date.now());
+const label = c => c.containerNo || ('Container #' + c.seq + ' of ' + (c.numContainers || '?'));
+const pendAppr = (id, k) => S.approvals.find(a => a.status === 'PENDING' && a.containerId === id && (!k || a.field === k));
+
+function prep(c) {
+  c._s = [c.id, c.containerNo, c.bookingNo, c.party, c.line, c.vessel, c.destination, c.invoiceNo, c.vehicleNo, c.sbNo, c.blNo, c.location, c.driverContact]
+    .filter(Boolean).join(' ').toLowerCase();
+  return c;
+}
+function matchQ(c) { for (const t of S.qTerms) if (c._s.indexOf(t) < 0) return false; return true; }
+
+function ingest(p) {
+  if (!p || p.same) { if (p) S.since = p.now; return false; }
+  S.me = p.me; S.users = p.users; S.rules = p.rules; S.settings = p.settings; S.approvals = p.approvals || []; S.url = p.url || S.url;
+  if (p.full) S.C = new Map();
+  (p.containers || []).forEach(c => S.C.set(c.id, prep(c)));
+  S.since = p.now;
+  persist();
+  return true;
+}
+let _pt = 0;
+function persist() {
+  clearTimeout(_pt);
+  _pt = setTimeout(() => LS.set('ct_snap', {
+    me: S.me, users: S.users, rules: S.rules, settings: S.settings, approvals: S.approvals, url: S.url, since: S.since,
+    containers: Array.from(S.C.values()).map(c => { const o = Object.assign({}, c); delete o._s; return o; })
+  }), 500);
+}
+function applyContainers(list) { (list || []).forEach(c => S.C.set(c.id, prep(c))); persist(); }
+function upsertAppr(a) { const i = S.approvals.findIndex(x => x.id === a.id); if (i >= 0) S.approvals[i] = a; else S.approvals.push(a); persist(); }
+
+/* ================================================================ server calls */
+function api(fn) {
+  const args = Array.prototype.slice.call(arguments, 1);
+  return new Promise((res, rej) => {
+    google.script.run.withSuccessHandler(res).withFailureHandler(err => {
+      const msg = String((err && err.message) || err).replace(/^(Exception|Error):\s*/, '');
+      if (msg === 'AUTH') { logout(true); return rej(new Error('Your session has expired — please sign in again.')); }
+      rej(new Error(msg));
+    })[fn].apply(null, args);
+  });
+}
+function kickNotify() { api('flushNotify', S.token).catch(() => {}); }
+function setSync(state) {
+  const d = $('#syncDot'), t = $('#syncTxt');
+  if (!d) return;
+  d.className = 'src-dot' + (state === 'live' ? ' live' : state === 'busy' ? ' busy' : '');
+  t.textContent = state === 'busy' ? 'Saving…' : state === 'off' ? 'Offline — retrying' : 'Live';
+}
+
+/* ================================================================ toast / modal */
+let _tt = 0;
+function toast(msg, kind) {
+  const t = $('#toast'); t.textContent = msg; t.className = 'toast on ' + (kind || '');
+  clearTimeout(_tt); _tt = setTimeout(() => t.className = 'toast', kind === 'err' ? 5200 : 2600);
+}
+let _mres = null, _mlock = false;
+function modal(html, cls, lock) {
+  const b = $('#modalBody'); b.className = 'modal ' + (cls || ''); b.innerHTML = html;
+  $('#modal').classList.add('on'); _mlock = !!lock;
+  const f = b.querySelector('input:not([type=hidden]):not([type=checkbox]),textarea,select'); if (f && window.innerWidth > 860) setTimeout(() => f.focus(), 30);
+}
+function closeModal(force) {
+  if (_mlock && !force) return;
+  $('#modal').classList.remove('on'); _mlock = false;
+  if (_mres) { const r = _mres; _mres = null; r(null); }
+}
+function confirmBox(msg, ok, danger) {
+  return new Promise(res => {
+    modal('<h2>Please confirm</h2><p class="msub" style="font-size:13.5px;color:var(--ink)">' + esc(msg) + '</p><div class="modal-foot"><button class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn ' + (danger ? 'btn-bad' : 'btn-dark') + '" data-act="mOk">' + esc(ok || 'Yes, continue') + '</button></div>');
+    _mres = v => res(v === true);
+  });
+}
+function promptBox(title, text, ph, opts) {
+  opts = opts || {};
+  return new Promise(res => {
+    modal('<form data-form="prompt"><h2>' + esc(title) + '</h2><p class="msub">' + esc(text) + '</p>' +
+      (opts.input ? '<input class="inp" name="v" placeholder="' + esc(ph || '') + '" value="' + esc(opts.value || '') + '">' : '<textarea class="inp" name="v" rows="3" placeholder="' + esc(ph || '') + '"></textarea>') +
+      '<div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">' + esc(opts.ok || 'Submit') + '</button></div></form>');
+    _mres = v => res(v === null || v === undefined ? null : v);
+  });
+}
+function resolveModal(v) { const r = _mres; _mres = null; $('#modal').classList.remove('on'); _mlock = false; if (r) r(v); }
+function busy(btn, on) {
+  if (!btn) return;
+  if (on) { btn._h = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin sm"></span>' + btn._h; }
+  else { btn.disabled = false; if (btn._h) btn.innerHTML = btn._h; }
+}
+
+/* ================================================================ boot / auth */
+function showApp() { $('#boot').hidden = true; $('#login').hidden = true; $('#app').hidden = false; }
+function showLogin() { $('#boot').hidden = true; $('#app').hidden = true; $('#login').hidden = false; }
+
+function start() {
+  bindEvents();
+  if (!S.token) return showLogin();
+  const snap = LS.get('ct_snap');
+  if (snap && snap.me) {
+    S.me = snap.me; S.users = snap.users || []; S.rules = snap.rules || {}; S.settings = snap.settings || {}; S.approvals = snap.approvals || []; S.url = snap.url || '';
+    (snap.containers || []).forEach(c => S.C.set(c.id, prep(c)));
+    S.since = snap.since || 0;
+    showApp(); render();
+  }
+  api('boot', S.token, snap && snap.me ? S.since : 0).then(p => {
+    ingest(p); showApp(); render(); postBoot();
+  }).catch(e => { if (S.token) { toast(e.message, 'err'); if (!S.me) showLogin(); } });
+}
+function postBoot() {
+  if (S.me && S.me.mustChange) pwModal(true);
+  if (DEEP && S.C.has(DEEP)) { openDrawer(DEEP); DEEP = ''; }
+}
+function logout(expired) {
+  S.token = null; S.me = null; S.C = new Map();
+  LS.del('ct_token'); LS.del('ct_snap');
+  closeModal(true); closeDrawer(true); showLogin();
+  if (expired) { const e = $('#loginErr'); e.textContent = 'Session expired — please sign in again.'; e.hidden = false; }
+}
+
+/* ================================================================ render shell */
+const VIEWS = {
+  dash: { t: 'Dashboard', nav: 'Dashboard', ic: 'dash', ok: () => true },
+  list: { t: 'Containers', nav: 'Containers', ic: 'list', ok: () => true },
+  appr: { t: 'Change approvals', nav: 'Approvals', ic: 'appr', ok: () => true },
+  rem: { t: 'My reminders', nav: 'Reminders', ic: 'rem', ok: () => true },
+  an: { t: 'Analytics', nav: 'Analytics', ic: 'chart', ok: isPC },
+  admin: { t: 'Admin panel', nav: 'Admin', ic: 'admin', ok: isAdmin }
+};
+function go(v) {
+  if (!VIEWS[v] || !VIEWS[v].ok()) v = 'dash';
+  S.view = v; LS.set('ct_view', v); S.limit = 120;
+  if (v === 'admin') S.adm = null; // refetch: a stale user form would overwrite a freshly linked Telegram chat id
+  $('#side').classList.remove('on');
+  render(); window.scrollTo(0, 0);
+}
+function render() {
+  if (!S.me) return;
+  if (!VIEWS[S.view] || !VIEWS[S.view].ok()) S.view = 'dash';
+  renderNav(); renderView();
+  if (S.open) renderDrawer();
+}
+function renderNav() {
+  const pendAp = S.approvals.filter(a => a.status === 'PENDING' && (isAdmin() || a.requestedBy === S.me.name)).length;
+  const myOver = pendingItems(false).filter(i => i.over).length;
+  const badge = { dash: myOver, appr: pendAp };
+  let h = '<div class="nav-label">Workspace</div>';
+  ['dash', 'list', 'appr', 'rem'].forEach(k => h += navItem(k, badge[k]));
+  if (isPC()) { h += '<div class="nav-label">Insights</div>' + navItem('an'); }
+  if (isAdmin()) h += navItem('admin');
+  $('#nav').innerHTML = h;
+  $('#meBox').innerHTML = '<div class="avatar">' + esc((S.me.name || '?').charAt(0)) + '</div><div style="min-width:0"><b>' + esc(S.me.name) + '</b>' + esc(DEF.roles[S.me.role] || '') + (S.me.tg ? ' · ✈︎' : '') + '</div>';
+  $('#newBtn').hidden = !can('S1');
+}
+function navItem(k, n) {
+  const v = VIEWS[k];
+  return '<button class="nav-item' + (S.view === k ? ' on' : '') + '" data-act="go" data-v="' + k + '">' + ICON[v.ic] + v.nav + (n ? '<span class="nb">' + n + '</span>' : '') + '</button>';
+}
+function renderView() {
+  S.charts.forEach(c => { try { c.destroy(); } catch (e) {} }); S.charts = [];
+  const v = S.view;
+  $('#pageTitle').textContent = VIEWS[v].t;
+  const hr = new Date().getHours();
+  $('#pageSub').textContent = v === 'dash' ? (hr < 12 ? 'Good morning' : hr < 17 ? 'Good afternoon' : 'Good evening') + ', ' + S.me.name + ' — here is what needs you.' :
+    v === 'list' ? 'Every container pipeline, live.' : v === 'appr' ? 'Edits to already-filled details wait here for admin approval.' :
+    v === 'rem' ? 'Self reminders delivered to your Telegram.' : v === 'an' ? 'Throughput, delays and who/what is slowing things down.' : 'Users, steps, deadlines and alerts.';
+  const el = $('#view');
+  if (v === 'dash') el.innerHTML = vDash();
+  else if (v === 'list') el.innerHTML = vList();
+  else if (v === 'appr') el.innerHTML = vAppr();
+  else if (v === 'rem') el.innerHTML = vRem();
+  else if (v === 'an') { el.innerHTML = vAn(); drawCharts(); }
+  else if (v === 'admin') el.innerHTML = vAdmin();
+}
+function refresh(fromSync) {
+  renderNav();
+  if (!fromSync || ['dash', 'list', 'appr'].indexOf(S.view) >= 0) renderView();
+  if (S.open && !(fromSync && (S.dirty || S.edit))) renderDrawer();
+}
+
+/* ================================================================ pending logic */
+function pendingItems(all) {
+  const out = [], now = Date.now();
+  S.C.forEach(c => {
+    if (c.status !== 'ACTIVE') return;
+    const s = ctState(c, S.rules, now);
+    if (s.cur && (all || can('S' + s.cur))) out.push({ c: c, n: s.cur, key: 'S' + s.cur, name: DEF.steps[s.cur - 1].name, due: s.due, over: s.over });
+    if (s.docsNeeded && (all || can('DOCS'))) out.push({ c: c, n: 'D', key: 'DOCS', name: 'Shipping Bill & BL upload', due: s.docsDue, over: s.docsOver });
+  });
+  return out.sort((a, b) => (b.over - a.over) || ((a.due || 9e15) - (b.due || 9e15)));
+}
+function dueChip(due, doneAt) {
+  if (doneAt) return '';
+  if (!due) return '<span class="due mute">Awaiting date</span>';
+  const d = due - Date.now();
+  if (d < 0) return '<span class="due bad">Overdue ' + human(d) + '</span>';
+  if (d < 6 * 3600e3) return '<span class="due warn">Due in ' + human(d) + '</span>';
+  return '<span class="due ok">Due ' + fmtShort(due) + '</span>';
+}
+function statusBadge(c) {
+  if (c.status === 'CLOSED') return '<span class="badge b-done"><span class="d"></span>Closed</span>';
+  if (c.status === 'CANCELLED') return '<span class="badge b-halt"><span class="d"></span>Cancelled</span>';
+  const s = st(c);
+  if (s.over || s.docsOver) return '<span class="badge b-halt"><span class="d"></span>Delayed</span>';
+  if (!s.cur) return '<span class="badge b-wait"><span class="d"></span>Gated-in</span>';
+  return '<span class="badge b-active"><span class="d"></span>Active</span>';
+}
+
+/* ================================================================ dashboard */
+function vDash() {
+  const now = Date.now(), mine = pendingItems(false).filter(i => matchQ(i.c));
+  const over = mine.filter(i => i.over), soon = mine.filter(i => !i.over && i.due && i.due - now < 864e5);
+  const act = Array.from(S.C.values()).filter(c => c.status === 'ACTIVE' && matchQ(c));
+  const allOver = isPC() ? pendingItems(true).filter(i => i.over && matchQ(i.c)) : over;
+  const bookings = new Set(act.map(c => c.bookingId)).size;
+  let h = '<div class="kpis">' +
+    kpi('feature', 'My pending tasks', mine.length, over.length + ' overdue · ' + soon.length + ' due in 24h', 'scrollPend') +
+    kpi(allOver.length ? 'bad' : '', isPC() ? 'Delayed (all users)' : 'My overdue', allOver.length, isPC() ? 'Steps past deadline right now' : 'Finish these first', 'listOver') +
+    kpi('', 'Due in next 24h', soon.length, 'Across my steps', 'scrollPend') +
+    kpi('', 'Active containers', act.length, bookings + ' booking' + (bookings === 1 ? '' : 's'), 'listActive') + '</div>';
+
+  // pipeline rail
+  const cnt = {}, bad = {};
+  act.forEach(c => {
+    const s = ctState(c, S.rules, now);
+    if (s.cur) { cnt[s.cur] = (cnt[s.cur] || 0) + 1; if (s.over) bad[s.cur] = (bad[s.cur] || 0) + 1; }
+    if (s.docsNeeded) { cnt.D = (cnt.D || 0) + 1; if (s.docsOver) bad.D = (bad.D || 0) + 1; }
+  });
+  h += '<div class="card"><div class="card-h"><h3>Pipeline right now</h3><span class="sub">Active containers waiting at each step · tap to filter</span></div><div class="rail">';
+  DEF.steps.slice(1).map(s => [s.n, s.short, 'S' + s.n]).concat([['D', 'SB & BL', 'DOCS']]).forEach(x => {
+    const n = cnt[x[0]] || 0, b = bad[x[0]] || 0;
+    h += '<div class="rail-node" data-act="railGo" data-k="' + x[2] + '"><div class="rail-line"></div><div class="rail-dot ' + (b ? 'bad' : n ? 'has' : '') + '">' + (x[0] === 'D' ? '📄' : x[0]) +
+      (n ? '<span class="cnt' + (b ? ' r' : '') + '">' + n + '</span>' : '') + '</div><div class="rail-name">' + esc(x[1]) + '</div></div>';
+  });
+  h += '</div></div>';
+
+  h += '<div class="row-2"><div class="card" id="pendCard"><div class="card-h"><h3>' + (isAdmin() ? 'All pending steps' : 'My pending tasks') + '</h3><span class="sub">Overdue first, then by deadline</span></div>' +
+    pendList(mine, 40, false) + '</div>';
+  if (isPC()) {
+    h += '<div class="card"><div class="card-h"><h3>Delayed — follow up</h3><span class="sub">Call the responsible person</span></div>' + pendList(allOver, 25, true) + '</div>';
+  } else {
+    const recent = Array.from(S.C.values()).filter(matchQ).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 8);
+    h += '<div class="card"><div class="card-h"><h3>Recently updated</h3></div>' + (recent.length ? '<div class="plist">' + recent.map(c => {
+      const s = st(c);
+      return '<div class="prow" data-act="open" data-id="' + c.id + '"><span class="snum">' + (s.cur || '✓') + '</span><div class="prow-main"><div class="t mono">' + esc(label(c)) + '</div><div class="s">' + esc(c.bookingNo) + ' · ' + esc(c.party || '') + '</div></div><div class="prow-r"><span class="tl-time">' + fmtShort(c.updatedAt) + '</span></div></div>';
+    }).join('') + '</div>' : '<div class="empty">Nothing yet.</div>') + '</div>';
+  }
+  h += '</div>';
+
+  // open files for tracking / charges owners
+  if (!isAdmin() && (can('TRACK') || can('CHARGES'))) {
+    const open = act.filter(c => c.s7_at).map(c => {
+      const miss = can('TRACK') ? DEF.sections[0].fields.filter(k => isEmpty(c[k])).length : 0;
+      return { c: c, miss: miss };
+    }).sort((a, b) => b.miss - a.miss);
+    h += '<div class="card" style="margin-top:16px"><div class="card-h"><h3>Open files — dispatched, not yet closed</h3><span class="sub">' + (can('TRACK') ? 'Shipment tracking details to maintain' : 'Record charges & proof photos') + '</span></div>' +
+      (open.length ? '<div class="tiles">' + open.slice(0, 30).map(o => tile(o.c, o.miss ? o.miss + ' tracking field' + (o.miss > 1 ? 's' : '') + ' empty' : '')).join('') + '</div>' : '<div class="empty">No dispatched containers open.</div>') + '</div>';
+  }
+  return h;
+}
+function kpi(cls, lbl, val, sub, act) {
+  return '<button class="kpi ' + cls + '" data-act="' + act + '"><div class="kpi-label">' + esc(lbl) + '</div><div class="kpi-val">' + val + '</div><div class="kpi-sub">' + esc(sub) + '</div></button>';
+}
+function pendList(items, lim, withCall) {
+  if (!items.length) return '<div class="empty"><b>All clear ✓</b>' + (S.q ? 'No match for “' + esc(S.q) + '”.' : 'Nothing waiting here.') + '</div>';
+  const more = items.length > lim ? '<button class="more" data-act="go" data-v="list">+ ' + (items.length - lim) + ' more — open Containers</button>' : '';
+  return '<div class="plist">' + items.slice(0, lim).map(i => {
+    const c = i.c;
+    const who = withCall ? assignees(i.key) : [];
+    return '<div class="prow" data-act="open" data-id="' + c.id + '" data-tab="' + (i.key === 'DOCS' ? 'docs' : 'pipe') + '">' +
+      '<span class="snum ' + (i.over ? 'bad' : i.key === 'DOCS' ? 'doc' : '') + '">' + (i.key === 'DOCS' ? 'SB' : 'S' + i.n) + '</span>' +
+      '<div class="prow-main"><div class="t"><span class="mono">' + esc(c.containerNo || '#' + c.seq + '/' + (c.numContainers || '?')) + '</span> · ' + esc(c.bookingNo) + '</div>' +
+      '<div class="s">' + esc(i.name) + ' · ' + esc(c.party || '') + '</div>' +
+      (withCall ? '<div class="s">' + (who.length ? '📞 ' + who.map(callee).join(', ') : '<span style="color:var(--bad)">Nobody assigned</span>') + '</div>' : '') + '</div>' +
+      '<div class="prow-r">' + dueChip(i.due) + '</div></div>';
+  }).join('') + '</div>' + more;
+}
+
+/* ================================================================ containers list */
+function filteredContainers() {
+  const f = S.lf, now = Date.now(), from = dayStart(f.from), to = f.to ? dayStart(f.to) + 864e5 : 0;
+  const out = [];
+  S.C.forEach(c => {
+    if (f.tab !== 'ALL' && (c.status || 'ACTIVE') !== f.tab) return;
+    if (from && (c.createdAt || 0) < from) return;
+    if (to && (c.createdAt || 0) >= to) return;
+    if (!matchQ(c)) return;
+    if (f.step) {
+      const s = ctState(c, S.rules, now);
+      if (f.step === 'OVER' && !(s.over || s.docsOver)) return;
+      if (f.step === 'DOCS' && !s.docsNeeded) return;
+      if (f.step === 'DONE' && s.cur) return;
+      if (/^S\d+$/.test(f.step) && s.cur !== +f.step.slice(1)) return;
+    }
+    out.push(c);
+  });
+  if (f.sort === 'due') {
+    const k = c => { const s = ctState(c, S.rules, now); return s.cur ? (s.due || 9e15) : 9.9e15; };
+    out.sort((a, b) => k(a) - k(b));
+  } else if (f.sort === 'no') out.sort((a, b) => String(a.containerNo || 'zz').localeCompare(String(b.containerNo || 'zz')));
+  else out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0) || String(a.bookingId).localeCompare(String(b.bookingId)) || a.seq - b.seq);
+  return out;
+}
+function vList() {
+  const f = S.lf, counts = { ACTIVE: 0, CLOSED: 0, CANCELLED: 0, ALL: 0 };
+  S.C.forEach(c => { counts[c.status || 'ACTIVE']++; counts.ALL++; });
+  const list = filteredContainers();
+  let h = '<div class="ctrl-bar"><div class="seg">' + [['ACTIVE', 'Active'], ['CLOSED', 'Closed'], ['CANCELLED', 'Cancelled'], ['ALL', 'All']].map(t =>
+    '<button class="' + (f.tab === t[0] ? 'on' : '') + '" data-act="lf" data-k="tab" data-v="' + t[0] + '">' + t[1] + '<span class="n">' + counts[t[0]] + '</span></button>').join('') + '</div>' +
+    '<label class="lbl">Booked from <input type="date" class="date-in" data-lf="from" value="' + esc(f.from) + '"></label>' +
+    '<label class="lbl">to <input type="date" class="date-in" data-lf="to" value="' + esc(f.to) + '"></label>' +
+    '<select class="sel" data-lf="step"><option value="">Any step</option><option value="OVER"' + (f.step === 'OVER' ? ' selected' : '') + '>⚠ Delayed only</option>' +
+    DEF.steps.slice(1).map(s => '<option value="S' + s.n + '"' + (f.step === 'S' + s.n ? ' selected' : '') + '>At S' + s.n + ' · ' + esc(s.short) + '</option>').join('') +
+    '<option value="DOCS"' + (f.step === 'DOCS' ? ' selected' : '') + '>SB / BL pending</option><option value="DONE"' + (f.step === 'DONE' ? ' selected' : '') + '>Gate-in done</option></select>' +
+    '<select class="sel" data-lf="sort"><option value="new">Newest first</option><option value="due"' + (f.sort === 'due' ? ' selected' : '') + '>Most urgent</option><option value="no"' + (f.sort === 'no' ? ' selected' : '') + '>Container no.</option></select>' +
+    '<button class="pill-t' + (f.group ? ' on' : '') + '" data-act="lf" data-k="group" data-v="' + (f.group ? '' : '1') + '">Group by booking</button>' +
+    ((f.from || f.to || f.step || S.q) ? '<button class="btn btn-ghost btn-sm" data-act="lfClear">Clear filters</button>' : '') +
+    '<span class="tl-time" style="margin-left:auto">' + list.length + ' container' + (list.length === 1 ? '' : 's') + '</span></div>';
+  if (!list.length) return h + '<div class="card"><div class="empty"><b>No containers match.</b>Try another tab, date range or search.</div></div>';
+  const shown = list.slice(0, S.limit);
+  if (f.group) {
+    const g = new Map();
+    shown.forEach(c => { if (!g.has(c.bookingId)) g.set(c.bookingId, []); g.get(c.bookingId).push(c); });
+    g.forEach(cs => {
+      const c = cs[0];
+      h += '<div class="bgroup"><div class="bgroup-h"><h4 class="mono">' + esc(c.bookingNo) + '</h4><span class="m">' + esc(c.party || '') + ' → ' + esc(c.destination || '') + ' · ' + esc(c.line || '') + ' / ' + esc(c.vessel || '') + ' · booked ' + fmtD(c.createdAt) + ' · ' + (c.numContainers || cs.length) + ' container(s)</span></div><div class="tiles">' +
+        cs.sort((a, b) => a.seq - b.seq).map(x => tile(x)).join('') + '</div></div>';
+    });
+  } else h += '<div class="tiles">' + shown.map(c => tile(c)).join('') + '</div>';
+  if (list.length > S.limit) h += '<button class="more" data-act="moreList">Show more (' + (list.length - S.limit) + ' remaining)</button>';
+  return h;
+}
+function tile(c, note) {
+  const s = st(c), cls = (s.over || s.docsOver) ? ' over' : c.status !== 'ACTIVE' ? ' closed' : '';
+  let rail = '';
+  for (let n = 1; n <= 10; n++) {
+    const at = c['s' + n + '_at'], due = c['s' + n + '_due'];
+    rail += '<i class="' + (at ? (due && at > due ? 'l' : 'd') : n === s.cur ? (s.over ? 'x' : 'c') : '') + '"></i>';
+  }
+  const stepTxt = c.status !== 'ACTIVE' ? (c.status === 'CLOSED' ? 'File closed ' + fmtD(c.statusAt) : 'Cancelled') :
+    s.cur ? 'S' + s.cur + ' · ' + DEF.steps[s.cur - 1].short : (s.docsNeeded ? 'SB / BL pending' : 'Gate-in done');
+  return '<button class="ctile' + cls + '" data-act="open" data-id="' + c.id + '">' +
+    '<div class="ct-top"><div class="ct-no ' + (c.containerNo ? 'mono' : 'na') + '">' + esc(c.containerNo || 'Not allotted yet') + '</div>' + statusBadge(c) + '</div>' +
+    '<div class="ct-sub"><b class="mono">' + esc(c.bookingNo) + '</b> · #' + c.seq + '/' + (c.numContainers || '?') + ' · ' + esc(c.line || '') + '</div>' +
+    '<div class="ct-sub">' + esc(c.party || '') + ' → ' + esc(c.destination || '') + '</div>' +
+    '<div class="mrail">' + rail + '</div>' +
+    '<div class="ct-foot"><span class="st">' + esc(note || stepTxt) + '</span>' + (c.status === 'ACTIVE' ? (s.cur ? dueChip(s.due) : s.docsNeeded ? dueChip(s.docsDue) : '') : '') + '</div></button>';
+}
+
+/* ================================================================ approvals view */
+function vAppr() {
+  const q = a => !S.q || S.qTerms.every(t => (a.containerLabel + ' ' + a.bookingNo + ' ' + a.fieldLabel + ' ' + a.requestedBy).toLowerCase().indexOf(t) >= 0);
+  const pend = S.approvals.filter(a => a.status === 'PENDING' && q(a)).sort((a, b) => b.createdAt - a.createdAt);
+  const done = S.approvals.filter(a => a.status !== 'PENDING' && q(a)).sort((a, b) => (b.decidedAt || 0) - (a.decidedAt || 0)).slice(0, 60);
+  return '<div class="card"><div class="card-h"><h3>Waiting for approval (' + pend.length + ')</h3><span class="sub">' + (isAdmin() ? 'Approve to apply the new value' : 'Visible to everyone; only admin decides') + '</span></div>' +
+    (pend.length ? pend.map(apprCard).join('') : '<div class="empty"><b>Nothing pending ✓</b></div>') + '</div>' +
+    '<div class="card"><div class="card-h"><h3>Decided in the last 14 days</h3></div>' + (done.length ? done.map(apprCard).join('') : '<div class="empty">None.</div>') + '</div>';
+}
+function apprCard(a) {
+  const b = { PENDING: 'b-warn', APPROVED: 'b-done', REJECTED: 'b-halt', WITHDRAWN: 'b-queued' }[a.status] || 'b-queued';
+  return '<div class="appr"><div class="appr-top"><div><div style="font-weight:700">' + esc(a.fieldLabel) + ' <span class="badge ' + b + '">' + esc(a.status.toLowerCase()) + '</span></div>' +
+    '<div class="tl-time"><a href="#" data-act="open" data-id="' + esc(a.containerId) + '" class="mono">' + esc(a.containerLabel) + '</a> · Booking ' + esc(a.bookingNo) + ' · by <b>' + esc(a.requestedBy) + '</b> · ' + fmtDT(a.createdAt) + '</div></div></div>' +
+    '<div class="diff"><div class="o">' + valHtml(a.field, a.oldValue) + '</div><span class="arr">→</span><div class="n">' + valHtml(a.field, a.newValue) + '</div></div>' +
+    (a.reason ? '<div class="tl-time" style="margin-top:8px">Reason: <b style="color:var(--ink)">' + esc(a.reason) + '</b></div>' : '') +
+    (a.status !== 'PENDING' && a.decidedBy ? '<div class="tl-time" style="margin-top:6px">' + esc(a.status.toLowerCase()) + ' by ' + esc(a.decidedBy) + ' · ' + fmtDT(a.decidedAt) + (a.note ? ' — “' + esc(a.note) + '”' : '') + '</div>' : '') +
+    (a.status === 'PENDING' ? '<div class="acts">' + (isAdmin() ? '<button class="btn btn-ok btn-sm" data-act="decide" data-id="' + a.id + '" data-ok="1">Approve</button><button class="btn btn-bad btn-sm" data-act="decide" data-id="' + a.id + '">Reject</button>' : '') +
+      (a.requestedBy === S.me.name ? '<button class="btn btn-ghost btn-sm" data-act="withdraw" data-id="' + a.id + '">Withdraw</button>' : '') + '</div>' : '') + '</div>';
+}
+
+/* ================================================================ reminders view */
+function vRem() {
+  if (!S.rems) { api('listReminders', S.token).then(r => { S.rems = r; if (S.view === 'rem') renderView(); }).catch(e => toast(e.message, 'err')); }
+  const now = new Date(Date.now() + 3600e3);
+  const opts = Array.from(S.C.values()).filter(c => c.status === 'ACTIVE').slice(0, 800).map(c => '<option value="' + esc(label(c) + ' · ' + c.bookingNo) + '">').join('');
+  let h = (!S.me.tg ? '<div class="card" style="border-color:var(--warn);background:var(--warn-wash)"><b>Telegram is not linked.</b> Reminders are delivered on Telegram — <a href="#" data-act="profile">link it from your profile</a>.</div>' : '') +
+    '<div class="row-2" style="margin-top:0"><form class="card" data-form="rem"><div class="card-h"><h3>New reminder</h3></div><div class="form-grid">' +
+    '<label class="fld wide"><span>Remind me to… <i>*</i></span><textarea class="inp" name="text" rows="2" placeholder="e.g. Call Harish Ji about BL for booking BK-123" required></textarea></label>' +
+    '<label class="fld"><span>When <i>*</i></span><input class="inp" type="datetime-local" name="at" value="' + toInput(now.getTime(), 'datetime') + '" required></label>' +
+    '<label class="fld"><span>Repeat</span><select class="inp" name="repeat"><option value="none">Once</option><option value="daily">Every day</option><option value="weekly">Every week</option></select></label>' +
+    '<label class="fld wide"><span>Link to container (optional)</span><input class="inp" name="cont" list="contList" placeholder="Type container / booking"><datalist id="contList">' + opts + '</datalist></label>' +
+    '</div><div class="act-foot"><span class="hint">Checked every 5 minutes.</span><button class="btn btn-dark">Save reminder</button></div></form>' +
+    '<div class="card"><div class="card-h"><h3>Scheduled</h3></div>';
+  if (!S.rems) h += '<div class="empty"><span class="spin"></span></div>';
+  else {
+    const act = S.rems.filter(r => r.active).sort((a, b) => a.at - b.at), old = S.rems.filter(r => !r.active);
+    h += act.length ? act.map(remRow).join('') : '<div class="empty">No upcoming reminders.</div>';
+    if (old.length) h += '<div class="dr-sec-t">Sent</div>' + old.slice(-10).reverse().map(remRow).join('');
+  }
+  return h + '</div></div>';
+}
+function remRow(r) {
+  const c = r.containerId && S.C.get(r.containerId);
+  return '<div class="rem"><span class="snum">' + (r.repeat === 'daily' ? 'D' : r.repeat === 'weekly' ? 'W' : '1') + '</span><div class="b"><div class="t">' + esc(r.text) + '</div><div class="m">' +
+    (r.active ? fmtDT(r.at) : 'Sent ' + fmtDT(r.lastSent)) + (r.repeat !== 'none' ? ' · repeats ' + r.repeat : '') + (c ? ' · <a href="#" data-act="open" data-id="' + c.id + '">' + esc(label(c)) + '</a>' : '') + '</div></div>' +
+    '<button class="icon-btn" title="Delete" data-act="delRem" data-id="' + r.id + '">✕</button></div>';
+}
+
+/* ================================================================ drawer */
+function openDrawer(id, tab) {
+  if (!S.C.has(id)) return toast('Container not found', 'err');
+  const same = S.open === id;
+  if (!same) { S.dirty = false; S.edit = null; }
+  S.dtab = tab || (same && S.dtab) || 'pipe';
+  S.open = id;
+  renderDrawer();
+  const d = $('#drawer'); d.classList.add('on'); d.setAttribute('aria-hidden', 'false'); d.scrollTop = 0;
+  $('#scrim').classList.add('on');
+}
+async function closeDrawer(force) {
+  if (!force && (S.dirty || S.edit) && !(await confirmBox('Discard your unsaved changes?', 'Discard', true))) return;
+  S.open = null; S.dirty = false; S.edit = null;
+  $('#drawer').classList.remove('on'); $('#drawer').setAttribute('aria-hidden', 'true'); $('#scrim').classList.remove('on');
+}
+function renderDrawer() {
+  const c = S.C.get(S.open);
+  if (!c) return closeDrawer(true);
+  const d = $('#drawer'), top = d.scrollTop, s = st(c);
+  const chTotal = chargeTotal(c);
+  const tabs = [['pipe', 'Pipeline'], ['track', 'Tracking'], ['docs', 'SB & BL' + (s.docsNeeded ? ' <span class="n">!</span>' : '')], ['chg', 'Charges' + (chTotal ? ' <span class="n">' + money(chTotal).replace('₹ ', '₹') + '</span>' : '')], ['hist', 'History']];
+  let h = '<div class="dr-head"><button class="dr-close" data-act="closeDrawer" aria-label="Close">✕</button>' +
+    '<div class="dr-t"><div class="dr-slab mono">' + esc(label(c)) + '</div>' + statusBadge(c) + '</div>' +
+    '<div class="dr-meta"><span>Booking <b class="mono">' + esc(c.bookingNo) + '</b> (#' + c.seq + '/' + (c.numContainers || '?') + ')</span><span>Party <b>' + esc(c.party || '—') + '</b></span>' +
+    '<span>Line <b>' + esc(c.line || '—') + '</b> · Vessel <b>' + esc(c.vessel || '—') + '</b></span><span>To <b>' + esc(c.destination || '—') + '</b></span>' +
+    (c.location ? '<span>Location <b>' + esc(c.location) + '</b></span>' : '') + '<span>ID <b class="mono">' + esc(c.id) + '</b></span></div>' +
+    '<div class="dr-tabs">' + tabs.map(t => '<button class="' + (S.dtab === t[0] ? 'on' : '') + '" data-act="dtab" data-t="' + t[0] + '">' + t[1] + '</button>').join('') + '</div></div><div class="dr-body">';
+  if (S.dtab === 'pipe') h += tabPipe(c, s);
+  else if (S.dtab === 'track') h += tabSection(c, 'TRACK');
+  else if (S.dtab === 'docs') h += tabDocs(c, s);
+  else if (S.dtab === 'chg') h += tabCharges(c);
+  else h += tabHist(c);
+  d.innerHTML = h + '</div>';
+  d.scrollTop = top;
+}
+
+function tabPipe(c, s) {
+  let h = '';
+  if (isAdmin()) {
+    h += '<div class="admin-bar">' + (c.status === 'ACTIVE' ?
+      '<button class="btn btn-dark btn-sm" data-act="setStatus" data-s="CLOSED">Close file</button><button class="btn btn-bad btn-sm" data-act="setStatus" data-s="CANCELLED">Cancel container</button>' :
+      '<button class="btn btn-ghost btn-sm" data-act="setStatus" data-s="ACTIVE">Reopen</button>') + '</div>';
+  }
+  if (c.status !== 'ACTIVE') h += '<div class="act wait"><b>' + (c.status === 'CLOSED' ? 'File closed' : 'Cancelled') + '</b> by ' + esc(c.statusBy || '') + ' on ' + fmtDT(c.statusAt) + (c.statusNote ? '<div class="tl-time" style="margin-top:4px">“' + esc(c.statusNote) + '”</div>' : '') + '</div>';
+  h += actionCard(c, s);
+  if (s.docsNeeded && can('DOCS')) h += '<div class="act ' + (s.docsOver ? 'bad' : '') + '"><div class="act-h"><h4><span class="snum doc">SB</span>Shipping Bill & BL are mandatory now</h4>' + dueChip(s.docsDue) + '</div><button class="btn btn-dark btn-sm" data-act="dtab" data-t="docs">Fill Shipping Bill & BL →</button></div>';
+
+  // timeline
+  h += '<div class="dr-sec-t">Process</div><div class="tl">';
+  DEF.steps.forEach(step => {
+    const n = step.n, at = c['s' + n + '_at'], dueSnap = c['s' + n + '_due'];
+    const isCur = n === s.cur, due = at ? dueSnap : isCur ? s.due : (n > 1 ? ctDue(c, n, S.rules) : null);
+    const late = at && dueSnap && at > dueSnap;
+    const dot = at ? (late ? 'late' : 'done') : isCur ? (s.over ? 'over' : 'active') : 'pending';
+    const vals = step.fields.filter(k => !isEmpty(c[k]) || pendAppr(c.id, k));
+    const canEdit = at && can(step.key) && editable(c) && step.fields.some(k => !DEF.fields[k].ro);
+    h += '<div class="tl-node"><div class="tl-dot ' + dot + '">' + (at ? '✓' : n) + '</div><div class="tl-card ' + (at ? '' : isCur ? 'active' : 'pending') + '">' +
+      '<div class="tl-top"><div class="tl-stage">' + n + '. ' + esc(step.name) + '</div><div style="display:flex;gap:6px;align-items:center">' +
+      (late ? '<span class="badge b-warn">Late ' + human(at - dueSnap) + '</span>' : '') + (isCur && c.status === 'ACTIVE' ? dueChip(due) : '') +
+      (canEdit ? '<button class="icon-btn" title="Edit" data-act="editStep" data-n="' + n + '">✎</button>' : '') + '</div></div>' +
+      '<div class="tl-time">' + (at ? 'Done ' + fmtDT(at) + ' by ' + esc(c['s' + n + '_by'] || '') : 'Pending') + (due ? ' · deadline ' + fmtDT(due) : '') + '</div>' +
+      (vals.length ? '<div class="tl-fields">' + vals.map(k => {
+        const p = pendAppr(c.id, k);
+        return '<span class="chip">' + esc(DEF.fields[k].l) + ': <b>' + valHtml(k, c[k]) + '</b>' + (p ? ' <span class="pendchg">⏳ ' + esc(fmtV(k, p.newValue)) + '</span>' : '') + '</span>';
+      }).join('') + '</div>' : '') + '</div></div>';
+  });
+  h += '</div>';
+
+  // siblings
+  const sib = Array.from(S.C.values()).filter(o => o.bookingId === c.bookingId).sort((a, b) => a.seq - b.seq);
+  h += '<div class="dr-sec-t">Containers in booking ' + esc(c.bookingNo) + (can('S1') && c.status === 'ACTIVE' ? '<button class="btn btn-ghost btn-sm" data-act="addCont">+ Add container</button>' : '') + '</div><div class="chips">' +
+    sib.map(o => '<button class="pill-t' + (o.id === c.id ? ' on' : '') + '" data-act="open" data-id="' + o.id + '">#' + o.seq + ' ' + esc(o.containerNo || '') + (o.status !== 'ACTIVE' ? ' · ' + o.status.toLowerCase() : '') + '</button>').join('') + '</div>';
+  return h;
+}
+
+function bulkSiblings(c, step) {
+  if (!step.bulk) return [];
+  const now = Date.now();
+  return Array.from(S.C.values()).filter(o => o.id !== c.id && o.bookingId === c.bookingId && o.status === 'ACTIVE' && ctState(o, S.rules, now).cur === step.n);
+}
+function actionCard(c, s) {
+  if (!s.cur || c.status !== 'ACTIVE') return '';
+  const step = DEF.steps[s.cur - 1];
+  if (!can(step.key)) {
+    const who = assignees(step.key);
+    return '<div class="act wait"><div class="act-h"><h4><span class="snum">' + step.n + '</span>Waiting on: ' + esc(step.name) + '</h4>' + dueChip(s.due) + '</div>' +
+      '<div class="callee">Responsible: ' + (who.length ? who.map(callee).join(', ') : '<b style="color:var(--bad)">nobody assigned</b>') + '</div></div>';
+  }
+  const pre = S.stash[c.id + ':' + step.n] || {};
+  const sibs = bulkSiblings(c, step);
+  const fields = step.fields.map(k => {
+    let v = pre[k];
+    if (v === undefined && k === 'gateInDate') v = Date.now();
+    return inputFor(k, v);
+  }).join('');
+  return '<form class="act ' + (s.over ? 'bad' : '') + '" data-form="step" data-n="' + step.n + '"><div class="act-h"><h4><span class="snum' + (s.over ? ' bad' : '') + '">' + step.n + '</span>' + esc(step.name) + '</h4>' + dueChip(s.due) + '</div>' +
+    '<div class="form-grid">' + fields + '</div>' +
+    '<div class="act-foot">' + (sibs.length ? '<label class="chk"><input type="checkbox" name="_bulk" checked> Also apply to the other ' + sibs.length + ' container' + (sibs.length > 1 ? 's' : '') + ' of this booking at this step</label>' : '<span></span>') +
+    '<button class="btn btn-dark">' + (step.mark ? '✓ Mark as done' : 'Save & complete step') + '</button></div></form>';
+}
+
+function inputFor(k, val) {
+  const f = DEF.fields[k], req = f.req ? ' required' : '';
+  let inp;
+  if (f.t === 'date' || f.t === 'datetime') inp = '<input class="inp" type="' + (f.t === 'date' ? 'date' : 'datetime-local') + '" name="' + k + '" value="' + toInput(val, f.t) + '"' + req + '>';
+  else if (f.t === 'select') inp = '<select class="inp" name="' + k + '"' + req + '><option value="">Select…</option>' + DEF.locations.map(o => '<option' + (o === val ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>';
+  else if (f.t === 'textarea') inp = '<textarea class="inp" name="' + k + '" rows="2">' + esc(val || '') + '</textarea>';
+  else if (f.t === 'money') inp = '<input class="inp mono" type="number" step="0.01" min="0" inputmode="decimal" name="' + k + '" value="' + (isEmpty(val) ? '' : esc(val)) + '" placeholder="₹ 0">';
+  else if (f.t === 'int') inp = '<input class="inp" type="number" min="1" max="200" step="1" inputmode="numeric" name="' + k + '" value="' + (isEmpty(val) ? '' : esc(val)) + '"' + req + '>';
+  else inp = '<input class="inp' + (f.up ? ' up mono' : '') + '" type="' + (f.t === 'tel' ? 'tel' : 'text') + '"' + (f.t === 'tel' ? ' inputmode="tel"' : '') + ' name="' + k + '" value="' + esc(val || '') + '"' + req + ' autocomplete="off">';
+  const hint = k === 'containerNo' ? '<span class="hint">Format: 4 letters + 7 digits, e.g. MSKU1234567</span>' : '';
+  return '<label class="fld' + (f.t === 'textarea' ? ' wide' : '') + '"><span>' + esc(f.l) + (f.req ? ' <i>*</i>' : '') + '</span>' + inp + hint + '</label>';
+}
+/** Read + validate a form. Returns {key: value} or null (invalid). */
+function readForm(form, keys, skipReq) {
+  const out = {}; let bad = null;
+  keys.forEach(k => {
+    const el = form.elements[k]; if (!el) return;
+    const f = DEF.fields[k]; let v = String(el.value || '').trim();
+    el.classList.remove('err');
+    if (f.req && !v && !skipReq) { el.classList.add('err'); bad = bad || el; }
+    if (f.t === 'date' || f.t === 'datetime') v = fromInput(v, f.t);
+    else if ((f.t === 'money' || f.t === 'int') && v !== '') v = Number(v);
+    else if (f.up) v = v.toUpperCase();
+    out[k] = v;
+  });
+  if (bad) { bad.focus(); toast('Please fill: ' + DEF.fields[bad.name].l, 'err'); return null; }
+  return out;
+}
+function diff(c, vals) {
+  const ch = {};
+  Object.keys(vals).forEach(k => { if (String(isEmpty(c[k]) ? '' : c[k]) !== String(isEmpty(vals[k]) ? '' : vals[k])) ch[k] = vals[k]; });
+  return ch;
+}
+
+/* ---------- sections */
+function sectionAttrs(c, keys) {
+  return '<div class="attr-grid">' + keys.map(k => {
+    const p = pendAppr(c.id, k);
+    return '<div class="attr"><div class="k">' + esc(DEF.fields[k].l) + '</div><div class="v' + (isEmpty(c[k]) ? ' e' : '') + '">' + valHtml(k, c[k]) + '</div>' +
+      (p ? '<div class="pendchg">⏳ pending: ' + esc(fmtV(k, p.newValue)) + '</div>' : '') + '</div>';
+  }).join('') + '</div>';
+}
+function tabSection(c, key) {
+  const sec = DEF.sections.find(s => s.key === key), ed = can(key) && editable(c);
+  const who = assignees(key);
+  let h = '<div class="dr-sec-t">' + esc(sec.name) + '<span style="text-transform:none;letter-spacing:0;font-weight:500">Owner: ' + (who.map(u => esc(u.name)).join(', ') || '—') + '</span></div>';
+  if (S.edit === key) {
+    return h + '<form class="act" data-form="section" data-k="' + key + '"><div class="form-grid">' + sec.fields.map(k => inputFor(k, c[k]).replace(' required', '')).join('') +
+      '</div><div class="act-foot"><span class="hint">Changing an already-filled value needs admin approval.</span><span><button type="button" class="btn btn-ghost" data-act="cancelEdit">Cancel</button> <button class="btn btn-dark">Save</button></span></div></form>';
+  }
+  const filled = sec.fields.filter(k => !isEmpty(c[k])).length;
+  h += '<div class="card-h" style="margin-bottom:10px"><span class="sub">' + filled + ' of ' + sec.fields.length + ' filled</span>' + (ed ? '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="' + key + '">✎ Edit details</button>' : '') + '</div>';
+  return h + sectionAttrs(c, sec.fields);
+}
+function tabDocs(c, s) {
+  const ed = can('DOCS') && editable(c), keys = ['sbNo', 'blNo'];
+  const done = c.sbNo && c.sbPhoto && c.blNo && c.blPhoto;
+  let h = '<div class="dr-sec-t">Shipping Bill & BL<span>' + (done ? '<span class="badge b-done">Complete ✓</span>' : s.docsNeeded ? dueChip(s.docsDue) : '<span class="badge b-queued">Required after dispatch</span>') + '</span></div>';
+  if (S.edit === 'DOCS') {
+    h += '<form class="act" data-form="section" data-k="DOCS"><div class="form-grid">' + keys.map(k => inputFor(k, c[k]).replace(' required', '')).join('') +
+      '</div><div class="act-foot"><span></span><span><button type="button" class="btn btn-ghost" data-act="cancelEdit">Cancel</button> <button class="btn btn-dark">Save numbers</button></span></div></form>';
+  }
+  h += '<div class="cgrp">';
+  [['sbNo', 'sbPhoto', 'Shipping Bill'], ['blNo', 'blPhoto', 'Bill of Lading (BL)']].forEach(x => {
+    const p = pendAppr(c.id, x[0]);
+    h += '<div class="crow"><div class="l">' + x[2] + ' No.<div class="' + (c[x[0]] ? 'amt' : 'amt e') + '" style="margin-top:3px">' + esc(c[x[0]] || 'not entered') + '</div>' + (p ? '<span class="pendchg">⏳ ' + esc(p.newValue) + '</span>' : '') + '</div>' +
+      '<div class="tl-time">Photo</div>' + slot(c, x[1], ed) + '</div>';
+  });
+  h += '</div>';
+  if (ed && S.edit !== 'DOCS') h += '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="DOCS">✎ ' + (c.sbNo || c.blNo ? 'Edit numbers' : 'Enter SB / BL numbers') + '</button>';
+  if (c.docs_at) h += '<p class="tl-time" style="margin-top:12px">Completed ' + fmtDT(c.docs_at) + ' by ' + esc(c.docs_by || '') + '</p>';
+  return h;
+}
+function chargeTotal(c) {
+  let t = 0;
+  DEF.chargeGroups.forEach(g => g.items.forEach(it => { t += Number(c[it[0]]) || 0; }));
+  for (let i = 1; i <= DEF.extraSlots; i++) t += Number(c['ex' + i + '_amt']) || 0;
+  return t;
+}
+function tabCharges(c) {
+  const ed = can('CHARGES') && editable(c), editing = S.edit === 'CHARGES';
+  let h = '<div class="grand"><span><span class="eyebrow" style="color:#A9A597">Total detention & extra cost</span></span><b>' + money(chargeTotal(c)) + '</b></div>';
+  h += '<div class="card-h" style="margin-bottom:10px"><span class="sub">' + (ed ? 'Photos upload instantly. Amounts: edit, then Save.' : 'Owner: ' + (assignees('CHARGES').map(u => esc(u.name)).join(', ') || '—')) + '</span>' +
+    (ed && !editing ? '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="CHARGES">✎ Edit amounts</button>' : '') + '</div>';
+  if (editing) h += '<form data-form="section" data-k="CHARGES">';
+  const amt = k => {
+    const p = pendAppr(c.id, k);
+    return editing ? '<input class="inp mono" type="number" step="0.01" min="0" inputmode="decimal" name="' + k + '" value="' + (isEmpty(c[k]) ? '' : c[k]) + '" placeholder="0">'
+      : '<div class="amt' + (isEmpty(c[k]) ? ' e' : '') + '">' + (isEmpty(c[k]) ? '—' : money(c[k])) + (p ? '<div class="pendchg">⏳ ' + esc(fmtV(k, p.newValue)) + '</div>' : '') + '</div>';
+  };
+  DEF.chargeGroups.forEach(g => {
+    let sub = 0; g.items.forEach(it => sub += Number(c[it[0]]) || 0);
+    h += '<div class="cgrp"><div class="cgrp-h"><span>' + esc(g.name) + '</span><span class="tot">' + (sub ? money(sub) : '') + '</span></div>' +
+      g.items.map(it => '<div class="crow"><div class="l">' + esc(it[1]) + '</div>' + amt(it[0]) + '<div class="slots">' + slot(c, it[0] + '_p1', ed) + slot(c, it[0] + '_p2', ed) + '</div></div>').join('') + '</div>';
+  });
+  let xs = 0; for (let i = 1; i <= DEF.extraSlots; i++) xs += Number(c['ex' + i + '_amt']) || 0;
+  h += '<div class="cgrp"><div class="cgrp-h"><span>Extra expenses (not listed above)</span><span class="tot">' + (xs ? money(xs) : '') + '</span></div>';
+  for (let i = 1; i <= DEF.extraSlots; i++) {
+    const d = 'ex' + i + '_desc', a = 'ex' + i + '_amt';
+    if (!editing && isEmpty(c[d]) && isEmpty(c[a]) && isEmpty(c['ex' + i + '_p1']) && !ed) continue;
+    h += '<div class="crow x"><div class="l">' + (editing ? '<input class="inp" name="' + d + '" value="' + esc(c[d] || '') + '" placeholder="Expense ' + i + ' — what was it?">' : (isEmpty(c[d]) ? '<span class="amt e">Slot ' + i + ' — empty</span>' : esc(c[d]))) + '</div>' +
+      amt(a) + '<div class="slots">' + slot(c, 'ex' + i + '_p1', ed) + slot(c, 'ex' + i + '_p2', ed) + '</div></div>';
+  }
+  h += '</div>';
+  if (editing) h += '<div class="act-foot" style="position:sticky;bottom:0;background:var(--bg);padding:12px 0"><span class="hint">Changing a filled amount needs admin approval.</span><span><button type="button" class="btn btn-ghost" data-act="cancelEdit">Cancel</button> <button class="btn btn-dark">Save amounts</button></span></div></form>';
+  return h;
+}
+function slot(c, key, ed) {
+  const v = c[key], p = pendAppr(c.id, key);
+  if (S.uploading[c.id + key]) return '<span class="slot busy"><span class="spin sm"></span>Uploading…</span>';
+  let h = '';
+  if (v) h += '<a class="slot has" href="' + esc(v) + '" target="_blank" rel="noopener">' + thumb(v) + '<span>View</span></a>';
+  if (ed) h += '<label class="slot" title="Upload photo or PDF">' + (v ? '↻' : '＋ Photo') + '<input type="file" accept="image/*,application/pdf" hidden data-up="' + key + '"></label><span class="lnk" data-act="linkFile" data-k="' + key + '" title="Paste a link instead">🔗</span>';
+  if (!v && !ed) h = '<span class="slot none">—</span>';
+  if (p) h += '<span class="pendchg">⏳ new file pending</span>';
+  return '<span class="slots">' + h + '</span>';
+}
+
+/* ---------- history */
+function tabHist(c) {
+  const H = S.hist[c.id];
+  if (!H || H.at !== c.updatedAt) loadHist(c.id);
+  const aps = S.approvals.filter(a => a.containerId === c.id);
+  let h = '';
+  if (aps.length) h += '<div class="dr-sec-t">Change requests</div>' + aps.map(apprCard).join('');
+  h += '<div class="dr-sec-t">Full history<span style="text-transform:none;letter-spacing:0;font-weight:500">visible to everyone</span></div>';
+  if (!H) return h + '<div class="empty"><span class="spin"></span></div>';
+  if (!H.rows.length) return h + '<div class="empty">No history yet.</div>';
+  const ic = { BOOKING: '＋', STEP: '✓', EDIT: '✎', REQUEST: '⏳', APPROVED: '✓', REJECTED: '✕', STATUS: '●', UPLOAD: '⇪' };
+  return h + H.rows.map(r => '<div class="hrow"><div class="hic ' + esc(r.type) + '">' + (ic[r.type] || '•') + '</div><div class="hbody"><div class="t">' + esc(r.detail) + '</div>' +
+    '<div class="m">' + esc(r.user) + ' · ' + fmtDT(r.ts) + '</div>' +
+    (r.oldV || r.newV ? '<div class="ch">' + (r.oldV ? '<s>' + esc(r.oldV) + '</s> → ' : '') + '<ins>' + esc(r.newV) + '</ins></div>' : '') + '</div></div>').join('');
+}
+function loadHist(id) {
+  if (S.histBusy[id]) return;
+  S.histBusy[id] = 1;
+  const at = (S.C.get(id) || {}).updatedAt;
+  api('getHistory', S.token, id).then(rows => {
+    S.hist[id] = { at: at, rows: rows };
+    if (S.open === id && S.dtab === 'hist') renderDrawer();
+  }).catch(e => toast(e.message, 'err')).finally(() => { delete S.histBusy[id]; });
+}
+
+/* ================================================================ actions: save flows */
+async function optimistic(ids, mutate, call) {
+  const backup = ids.map(id => S.C.get(id));
+  ids.forEach(id => { const o = Object.assign({}, S.C.get(id)); mutate(o); o.updatedAt = Date.now(); S.C.set(id, prep(o)); });
+  refresh(); setSync('busy');
+  try {
+    const r = (await call()) || {};
+    if (r.confirm) backup.forEach(o => S.C.set(o.id, o));
+    else applyContainers(r.containers);
+    refresh(); setSync('live');
+    return r;
+  } catch (e) {
+    backup.forEach(o => S.C.set(o.id, o));
+    refresh(); setSync('live');
+    throw e;
+  }
+}
+
+async function submitStep(form) {
+  const n = +form.dataset.n, step = DEF.steps[n - 1], c = S.C.get(S.open);
+  const vals = readForm(form, step.fields);
+  if (!vals) return;
+  if (vals.containerNo && !/^[A-Z]{4}\d{7}$/.test(vals.containerNo) && !(await confirmBox('“' + vals.containerNo + '” does not look like a standard container number (4 letters + 7 digits). Save anyway?'))) return;
+  const bulk = !!(form.elements._bulk && form.elements._bulk.checked);
+  const ids = [c.id].concat(bulk ? bulkSiblings(c, step).map(o => o.id) : []);
+  const key = c.id + ':' + n; S.stash[key] = vals; S.dirty = false;
+  const now = Date.now();
+  const mutate = o => {
+    const due = ctDue(o, n, S.rules);
+    Object.keys(vals).forEach(k => { if (isEmpty(vals[k])) delete o[k]; else o[k] = vals[k]; });
+    o['s' + n + '_at'] = now; o['s' + n + '_by'] = S.me.name; if (due) o['s' + n + '_due'] = due;
+  };
+  try {
+    let r = await optimistic(ids, mutate, () => api('completeStep', S.token, c.id, n, vals, bulk, false));
+    if (r.confirm) {
+      if (!(await confirmBox(r.confirm))) return;
+      r = await optimistic(ids, mutate, () => api('completeStep', S.token, c.id, n, vals, bulk, true));
+    }
+    delete S.stash[key];
+    toast('✓ ' + step.short + ' done' + (ids.length > 1 ? ' for ' + ids.length + ' containers' : ''), 'ok');
+    kickNotify();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function submitChanges(id, changes) {
+  const c = S.C.get(id), keys = Object.keys(changes);
+  if (!keys.length) { toast('Nothing changed'); return true; }
+  let reason = '';
+  if (!isAdmin() && keys.some(k => !isEmpty(c[k]))) {
+    reason = await promptBox('Needs admin approval', 'Some of these details were already filled. The change will be applied after admin approves it. Why is it changing?', 'e.g. wrong number entered earlier');
+    if (reason === null) return false;
+  }
+  const direct = keys.filter(k => isAdmin() || isEmpty(c[k]));
+  const booking = direct.some(k => DEF.fields[k].own === 'S1');
+  const ids = booking ? Array.from(S.C.values()).filter(o => o.bookingId === c.bookingId).map(o => o.id) : [id];
+  try {
+    const r = await optimistic(direct.length ? ids : [], o => direct.forEach(k => { if (isEmpty(changes[k])) delete o[k]; else o[k] = changes[k]; }),
+      () => api('saveFields', S.token, id, changes, reason));
+    (r.approvals || []).forEach(upsertAppr);
+    const na = (r.approvals || []).length;
+    toast(na ? (direct.length ? 'Saved · ' : '') + na + ' change' + (na > 1 ? 's' : '') + ' sent for admin approval' : 'Saved ✓', 'ok');
+    if (na) refresh();
+    kickNotify();
+    return true;
+  } catch (e) { toast(e.message, 'err'); return false; }
+}
+
+async function uploadTo(id, key, file) {
+  const c = S.C.get(id);
+  if (!file) return;
+  if (file.size > 20e6) return toast('File too large (max 20 MB).', 'err');
+  let reason = '';
+  if (!isAdmin() && !isEmpty(c[key])) {
+    reason = await promptBox('Replace file — needs approval', 'A file is already attached here. The replacement will apply after admin approves it. Reason?', 'e.g. earlier photo was blurry');
+    if (reason === null) return;
+  }
+  S.uploading[id + key] = 1; renderDrawer();
+  try {
+    const f = await prepFile(file);
+    const r = await api('uploadFile', S.token, id, key, f.name, f.mime, f.b64, reason);
+    applyContainers(r.containers); (r.approvals || []).forEach(upsertAppr);
+    toast((r.approvals || []).length ? 'Uploaded — sent for admin approval' : 'Uploaded ✓', 'ok');
+    kickNotify();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { delete S.uploading[id + key]; refresh(); }
+}
+function loadImg(src) { return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; }); }
+async function prepFile(file) {
+  if (/^image\/(jpeg|png|webp|bmp)/.test(file.type)) {
+    try {
+      const url = URL.createObjectURL(file), img = await loadImg(url);
+      const k = Math.min(1, 1600 / Math.max(img.width, img.height)), cv = document.createElement('canvas');
+      cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k);
+      const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height); g.drawImage(img, 0, 0, cv.width, cv.height);
+      URL.revokeObjectURL(url);
+      return { b64: cv.toDataURL('image/jpeg', 0.82).split(',')[1], mime: 'image/jpeg', name: file.name.replace(/\.\w+$/, '') + '.jpg' };
+    } catch (e) { /* fall through to raw upload */ }
+  }
+  const data = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(file); });
+  return { b64: String(data).split(',')[1], mime: file.type || 'application/octet-stream', name: file.name };
+}
+
+/* ================================================================ modals: booking, edit, profile, password */
+function bookingModal() {
+  modal('<form data-form="booking"><h2>New booking</h2><p class="msub">One booking splits into one pipeline per container.</p><div class="form-grid">' +
+    DEF.steps[0].fields.map(k => inputFor(k, k === 'numContainers' ? 1 : '')).join('') +
+    '</div><div class="note">Timestamp is recorded automatically. Users assigned to <b>Container Allotment Date</b> are notified on Telegram.</div>' +
+    '<div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">Create booking</button></div></form>');
+}
+async function submitBooking(form, force) {
+  const vals = readForm(form, DEF.steps[0].fields);
+  if (!vals) return;
+  const btn = form.querySelector('button:not([type=button])'); busy(btn, true);
+  try {
+    let r = await api('createBooking', S.token, vals, !!force);
+    if (r.confirm) {
+      busy(btn, false);
+      if (!(await confirmBox(r.confirm, 'Create anyway'))) return;
+      r = await api('createBooking', S.token, vals, true);
+    }
+    closeModal(true);
+    applyContainers(r.containers);
+    toast('Booking ' + vals.bookingNo + ' created · ' + r.containers.length + ' container pipeline' + (r.containers.length > 1 ? 's' : ''), 'ok');
+    kickNotify(); refresh();
+    openDrawer(r.containers[0].id);
+  } catch (e) { busy(btn, false); toast(e.message, 'err'); }
+}
+function editStepModal(n) {
+  const c = S.C.get(S.open), step = DEF.steps[n - 1];
+  const keys = step.fields.filter(k => !DEF.fields[k].ro);
+  modal('<form data-form="editFields" data-keys="' + keys.join(',') + '"><h2>Edit — ' + esc(step.name) + '</h2><p class="msub">' +
+    (isAdmin() ? 'Admin edits apply immediately.' : 'Empty fields save directly; changing a filled value goes to admin for approval.') + (n === 1 ? ' Booking details apply to every container in this booking.' : '') + '</p>' +
+    '<div class="form-grid">' + keys.map(k => inputFor(k, c[k]).replace(' required', '')).join('') + '</div>' +
+    '<div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">Save changes</button></div></form>', 'wide');
+}
+function profileModal() {
+  const me = S.me, steps = (me.steps || []).map(k => '<span class="chip">' + esc(stepLabel(k)) + '</span>').join('') || (isAdmin() ? '<span class="chip">All steps (admin)</span>' : '<span class="hint">No steps assigned</span>');
+  modal('<div style="display:flex;align-items:center;gap:14px;margin-bottom:16px"><div class="avatar" style="width:48px;height:48px;font-size:20px">' + esc(me.name.charAt(0)) + '</div><div><h2 style="margin:0">' + esc(me.name) + '</h2><div class="tl-time">@' + esc(me.username) + ' · ' + esc(DEF.roles[me.role]) + (me.mobile ? ' · ' + esc(me.mobile) : '') + '</div></div></div>' +
+    '<div class="dr-sec-t">My steps</div><div class="chips">' + steps + '</div>' +
+    '<div class="dr-sec-t">Telegram alerts</div><div class="tg-box" id="tgBox">' + (me.tg ? '<b style="color:var(--ok)">✓ Linked</b> — you receive task, deadline and delay alerts.<div class="modal-foot" style="justify-content:flex-start;margin-top:10px"><button class="btn btn-ghost btn-sm" data-act="tgTest">Send test message</button><button class="btn btn-ghost btn-sm" data-act="tgLink">Re-link</button></div>'
+      : 'Not linked yet. <div class="modal-foot" style="justify-content:flex-start;margin-top:10px"><button class="btn btn-amber btn-sm" data-act="tgLink">Link Telegram</button></div>') + '</div>' +
+    '<div class="dr-sec-t">Password</div><button class="btn btn-ghost btn-sm" data-act="pw">Change password</button>' +
+    '<div class="modal-foot"><button class="btn btn-bad" data-act="logout">Sign out</button><button class="btn btn-dark" data-act="mCancel">Close</button></div>');
+}
+function pwModal(forced) {
+  modal('<form data-form="pw"><h2>' + (forced ? 'Set your own password' : 'Change password') + '</h2><p class="msub">' + (forced ? 'You are using a temporary password. Choose a new one to continue.' : 'At least 6 characters.') + '</p>' +
+    '<div class="form-grid"><label class="fld wide"><span>Current password</span><input class="inp" type="password" name="o" autocomplete="current-password" required></label>' +
+    '<label class="fld"><span>New password</span><input class="inp" type="password" name="n" minlength="6" autocomplete="new-password" required></label>' +
+    '<label class="fld"><span>Repeat new password</span><input class="inp" type="password" name="n2" minlength="6" autocomplete="new-password" required></label></div>' +
+    '<div class="modal-foot">' + (forced ? '<button type="button" class="btn btn-ghost" data-act="logout">Sign out</button>' : '<button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button>') + '<button class="btn btn-dark">Save password</button></div></form>', '', forced);
+}
+function stepLabel(k) {
+  if (/^S\d+$/.test(k)) return k + ' · ' + DEF.steps[+k.slice(1) - 1].name;
+  const s = DEF.sections.find(x => x.key === k); return s ? s.name : k;
+}
+
+/* ================================================================ analytics */
+let _chartLoad = null;
+function loadChart() {
+  if (window.Chart) return Promise.resolve();
+  if (!_chartLoad) _chartLoad = new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js'; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+  return _chartLoad;
+}
+function anRange() {
+  const a = S.an, now = new Date();
+  if (a.preset === 'custom' && a.from) return [dayStart(a.from), a.to ? dayStart(a.to) + 864e5 : Date.now() + 864e5];
+  if (a.preset === '30') return [Date.now() - 30 * 864e5, Date.now() + 864e5];
+  if (a.preset === '90') return [Date.now() - 90 * 864e5, Date.now() + 864e5];
+  if (a.preset === 'year') return [new Date(now.getFullYear(), 0, 1).getTime(), Date.now() + 864e5];
+  return [new Date(now.getFullYear(), now.getMonth(), 1).getTime(), Date.now() + 864e5];
+}
+function computeAn() {
+  const [from, to] = anRange(), now = Date.now(), cs = Array.from(S.C.values());
+  const inR = t => t && t >= from && t < to;
+  const d = new Date(), mS = new Date(d.getFullYear(), d.getMonth(), 1).getTime(), lmS = new Date(d.getFullYear(), d.getMonth() - 1, 1).getTime();
+  const docsH = ((S.rules.DOCS || {}).hours || 24) * 3600e3;
+  const A = { dispThis: 0, dispLast: 0, active: 0, overNow: 0, stepsTotal: 0, stepsLate: 0, delayedC: 0, bookedC: 0, cycle: [], closed: 0, byUser: {}, byStep: {}, months: [] };
+  for (let i = 5; i >= 0; i--) { const m = new Date(d.getFullYear(), d.getMonth() - i, 1); A.months.push({ s: m.getTime(), e: new Date(m.getFullYear(), m.getMonth() + 1, 1).getTime(), l: MON[m.getMonth()] + ' ' + String(m.getFullYear()).slice(2), disp: 0, late: 0, ok: 0 }); }
+  const U = n => A.byUser[n] = A.byUser[n] || { late: 0, over: 0 };
+  const P = k => A.byStep[k] = A.byStep[k] || { late: 0, ok: 0, over: 0, hrs: 0, cnt: 0 };
+  cs.forEach(c => {
+    const s = ctState(c, S.rules, now);
+    if (c.s7_at >= mS) A.dispThis++; else if (c.s7_at >= lmS && c.s7_at < mS) A.dispLast++;
+    if (c.status === 'ACTIVE') A.active++;
+    if (c.status === 'CLOSED' && inR(c.statusAt)) A.closed++;
+    let delayed = s.over || s.docsOver || s.late > 0;
+    for (let n = 2; n <= 10; n++) {
+      const at = c['s' + n + '_at'], due = c['s' + n + '_due'], prev = c['s' + (n - 1) + '_at'];
+      if (!inR(at)) continue;
+      const p = P('S' + n);
+      if (prev) { p.hrs += (at - prev) / 3600e3; p.cnt++; }
+      if (!due) continue;
+      A.stepsTotal++;
+      if (at > due) { A.stepsLate++; p.late++; U(c['s' + n + '_by'] || '?').late++; } else p.ok++;
+    }
+    if (c.docs_at && c.s7_at && inR(c.docs_at)) {
+      const p = P('DOCS'); p.hrs += (c.docs_at - c.s7_at) / 3600e3; p.cnt++; A.stepsTotal++;
+      if (c.docs_at > c.s7_at + docsH) { A.stepsLate++; p.late++; U(c.docs_by || '?').late++; delayed = true; } else p.ok++;
+    }
+    if (c.status === 'ACTIVE') {
+      [[s.over, 'S' + s.cur], [s.docsOver, 'DOCS']].forEach(x => {
+        if (!x[0]) return;
+        A.overNow++; P(x[1]).over++;
+        const who = assignees(x[1]); (who.length ? who : [{ name: 'Unassigned' }]).forEach(u => U(u.name).over++);
+      });
+    }
+    if (inR(c.createdAt)) { A.bookedC++; if (delayed) A.delayedC++; }
+    if (inR(c.s10_at) && c.createdAt) A.cycle.push((c.s10_at - c.createdAt) / 864e5);
+    A.months.forEach(m => {
+      if (c.s7_at >= m.s && c.s7_at < m.e) m.disp++;
+      if (c.createdAt >= m.s && c.createdAt < m.e && c.status !== 'CANCELLED') { if (delayed) m.late++; else m.ok++; }
+    });
+  });
+  return A;
+}
+function vAn() {
+  const A = computeAn(), a = S.an;
+  const diffP = A.dispLast ? Math.round((A.dispThis - A.dispLast) / A.dispLast * 100) : null;
+  const onTime = A.stepsTotal ? Math.round((1 - A.stepsLate / A.stepsTotal) * 100) : null;
+  const cyc = A.cycle.length ? (A.cycle.reduce((x, y) => x + y, 0) / A.cycle.length).toFixed(1) : '—';
+  let h = '<div class="ctrl-bar"><div class="seg">' + [['month', 'This month'], ['30', 'Last 30 days'], ['90', 'Last 90 days'], ['year', 'This year'], ['custom', 'Custom']].map(p =>
+    '<button class="' + (a.preset === p[0] ? 'on' : '') + '" data-act="anPreset" data-v="' + p[0] + '">' + p[1] + '</button>').join('') + '</div>' +
+    (a.preset === 'custom' ? '<label class="lbl">From <input type="date" class="date-in" data-an="from" value="' + esc(a.from) + '"></label><label class="lbl">to <input type="date" class="date-in" data-an="to" value="' + esc(a.to) + '"></label>' : '') + '</div>';
+  h += '<div class="kpi-strip">' +
+    '<div class="kpi feature"><div class="kpi-label">Dispatched this month</div><div class="kpi-val">' + A.dispThis + '</div><div class="kpi-sub">' + (diffP === null ? 'no data last month' : '<span class="kpi-chip ' + (diffP >= 0 ? 'up' : 'down') + '">' + (diffP >= 0 ? '▲' : '▼') + Math.abs(diffP) + '%</span> vs ' + A.dispLast + ' last month') + '</div></div>' +
+    '<div class="kpi"><div class="kpi-label">Active containers</div><div class="kpi-val">' + A.active + '</div></div>' +
+    '<div class="kpi bad"><div class="kpi-label">Overdue right now</div><div class="kpi-val">' + A.overNow + '</div><div class="kpi-sub">steps past deadline</div></div>' +
+    '<div class="kpi"><div class="kpi-label">Delayed containers</div><div class="kpi-val">' + A.delayedC + '<span class="u">/ ' + A.bookedC + '</span></div><div class="kpi-sub">booked in range</div></div>' +
+    '<div class="kpi"><div class="kpi-label">On-time steps</div><div class="kpi-val">' + (onTime === null ? '—' : onTime + '<span class="u">%</span>') + '</div><div class="kpi-sub">' + A.stepsLate + ' late of ' + A.stepsTotal + '</div></div>' +
+    '<div class="kpi"><div class="kpi-label">Avg booking → gate-in</div><div class="kpi-val">' + cyc + '<span class="u">days</span></div><div class="kpi-sub">' + A.closed + ' files closed in range</div></div></div>';
+  h += '<div class="a-grid">' +
+    '<div class="card"><div class="card-h"><h3>Containers dispatched per month</h3><span class="sub">Last 6 months</span></div><div class="chart-box"><canvas id="ch1"></canvas></div></div>' +
+    '<div class="card"><div class="card-h"><h3>Delayed vs on-time containers</h3><span class="sub">By booking month</span></div><div class="chart-box"><canvas id="ch2"></canvas></div></div>' +
+    '<div class="card"><div class="card-h"><h3>Who is causing delays</h3><span class="sub">Late completions in range + overdue now</span></div><div class="chart-box"><canvas id="ch3"></canvas></div></div>' +
+    '<div class="card"><div class="card-h"><h3>Which steps get delayed</h3><span class="sub">Completed in range</span></div><div class="chart-box"><canvas id="ch4"></canvas></div></div>' +
+    '<div class="card"><div class="card-h"><h3>Average time per step</h3><span class="sub">Hours from step opening to completion</span></div><div class="chart-box"><canvas id="ch5"></canvas></div></div>' +
+    '<div class="card"><div class="card-h"><h3>App visits per day</h3><span class="sub">Last 14 days, by user</span></div><div class="chart-box"><canvas id="ch6"></canvas></div><div id="visTbl" style="margin-top:12px"></div></div>' +
+    '</div>';
+  S._an = A;
+  return h;
+}
+const PAL = ['#D9A52C', '#5E7FA6', '#4F9D69', '#CF4F33', '#E0892F', '#232220', '#8E6CB0', '#3F9C9A'];
+async function drawCharts() {
+  try { await loadChart(); } catch (e) { toast('Could not load charts library', 'err'); return; }
+  if (S.view !== 'an') return;
+  const A = S._an, C = window.Chart;
+  C.defaults.font.family = 'Inter, system-ui, sans-serif'; C.defaults.color = '#6C685D'; C.defaults.borderColor = '#E8E3D6';
+  const base = (extra) => Object.assign({ responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { boxWidth: 10, boxHeight: 10, usePointStyle: true } } } }, extra || {});
+  const mk = (id, cfg) => { const el = document.getElementById(id); if (el) S.charts.push(new C(el, cfg)); };
+  const stepKeys = DEF.steps.slice(1).map(s => 'S' + s.n).concat(['DOCS']);
+  const stepLbl = k => k === 'DOCS' ? 'SB/BL' : DEF.steps[+k.slice(1) - 1].short;
+  mk('ch1', { type: 'bar', data: { labels: A.months.map(m => m.l), datasets: [{ label: 'Dispatched', data: A.months.map(m => m.disp), backgroundColor: '#F2C14E', borderRadius: 8 }] }, options: base({ plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }) });
+  mk('ch2', { type: 'bar', data: { labels: A.months.map(m => m.l), datasets: [{ label: 'On time', data: A.months.map(m => m.ok), backgroundColor: '#4F9D69', borderRadius: 6 }, { label: 'Delayed', data: A.months.map(m => m.late), backgroundColor: '#CF4F33', borderRadius: 6 }] }, options: base({ scales: { x: { stacked: true }, y: { stacked: true, ticks: { precision: 0 } } } }) });
+  const users = Object.keys(A.byUser).sort((a, b) => (A.byUser[b].late + A.byUser[b].over) - (A.byUser[a].late + A.byUser[a].over)).slice(0, 10);
+  mk('ch3', { type: 'bar', data: { labels: users, datasets: [{ label: 'Completed late', data: users.map(u => A.byUser[u].late), backgroundColor: '#E0892F', borderRadius: 6 }, { label: 'Overdue now', data: users.map(u => A.byUser[u].over), backgroundColor: '#CF4F33', borderRadius: 6 }] }, options: base({ indexAxis: 'y', scales: { x: { stacked: true, ticks: { precision: 0 } }, y: { stacked: true } } }) });
+  mk('ch4', { type: 'bar', data: { labels: stepKeys.map(stepLbl), datasets: [{ label: 'On time', data: stepKeys.map(k => (A.byStep[k] || {}).ok || 0), backgroundColor: '#4F9D69', borderRadius: 6 }, { label: 'Late', data: stepKeys.map(k => (A.byStep[k] || {}).late || 0), backgroundColor: '#E0892F', borderRadius: 6 }, { label: 'Overdue now', data: stepKeys.map(k => (A.byStep[k] || {}).over || 0), backgroundColor: '#CF4F33', borderRadius: 6 }] }, options: base({ scales: { x: { stacked: true }, y: { stacked: true, ticks: { precision: 0 } } } }) });
+  mk('ch5', { type: 'bar', data: { labels: stepKeys.map(stepLbl), datasets: [{ label: 'Avg hours', data: stepKeys.map(k => { const p = A.byStep[k]; return p && p.cnt ? +(p.hrs / p.cnt).toFixed(1) : 0; }), backgroundColor: '#5E7FA6', borderRadius: 8 }] }, options: base({ plugins: { legend: { display: false } } }) });
+  try {
+    if (!S.visits || Date.now() - S.visits.t > 120000) S.visits = { t: Date.now(), d: await api('getVisits', S.token, 14) };
+    if (S.view !== 'an') return;
+    const V = S.visits.d, uid = {};
+    V.forEach(x => Object.keys(x.v).forEach(k => uid[k] = 1));
+    const ids = Object.keys(uid), name = id => (S.users.find(u => u.id === id) || { name: id }).name;
+    mk('ch6', { type: 'line', data: { labels: V.map(x => x.d.slice(8) + ' ' + MON[+x.d.slice(5, 7) - 1]), datasets: ids.map((id, i) => ({ label: name(id), data: V.map(x => x.v[id] || 0), borderColor: PAL[i % PAL.length], backgroundColor: PAL[i % PAL.length], tension: .3, pointRadius: 2 })) }, options: base({ scales: { y: { ticks: { precision: 0 }, beginAtZero: true } } }) });
+    const rows = ids.map(id => { const tot = V.reduce((s, x) => s + (x.v[id] || 0), 0); return [name(id), (tot / V.length).toFixed(1), V[V.length - 1].v[id] || 0, tot]; }).sort((a, b) => b[3] - a[3]);
+    const el = $('#visTbl'); if (el) el.innerHTML = '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>User</th><th>Avg / day</th><th>Today</th><th>14 days</th></tr></thead><tbody>' + rows.map(r => '<tr><td>' + esc(r[0]) + '</td><td class="mono">' + r[1] + '</td><td class="mono">' + r[2] + '</td><td class="mono">' + r[3] + '</td></tr>').join('') + '</tbody></table></div>';
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ================================================================ admin */
+function vAdmin() {
+  if (!S.adm) { api('adminData', S.token).then(d => { S.adm = d; if (S.view === 'admin') renderView(); }).catch(e => toast(e.message, 'err')); return '<div class="card"><div class="empty"><span class="spin"></span></div></div>'; }
+  let h = '<div class="ctrl-bar"><div class="seg">' + [['users', 'Users'], ['wf', 'Workflow & deadlines'], ['alerts', 'Telegram & alerts']].map(t =>
+    '<button class="' + (S.atab === t[0] ? 'on' : '') + '" data-act="atab" data-t="' + t[0] + '">' + t[1] + '</button>').join('') + '</div></div>';
+  if (S.atab === 'users') h += admUsers();
+  else if (S.atab === 'wf') h += admWorkflow();
+  else h += admAlerts();
+  return h;
+}
+function admUsers() {
+  const us = S.adm.users;
+  return '<div class="card"><div class="card-h"><h3>Users (' + us.length + ')</h3><button class="btn btn-amber btn-sm" data-act="userEdit">+ Add user</button></div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Mobile</th><th>Telegram</th><th>Steps</th><th>Status</th></tr></thead><tbody>' +
+    us.map(u => '<tr class="click" data-act="userEdit" data-id="' + u.id + '"><td><b>' + esc(u.name) + '</b></td><td class="mono">' + esc(u.username) + '</td><td>' + esc(DEF.roles[u.role]) + '</td><td class="mono">' + esc(u.mobile || '—') + '</td>' +
+      '<td>' + (u.telegramChatId ? '<span class="badge b-done">linked</span>' : '<span class="badge b-queued">no</span>') + '</td><td><div class="chips">' + (u.role === 'admin' ? '<span class="chip">all</span>' : u.steps.map(s => '<span class="chip">' + esc(s) + '</span>').join('') || '—') + '</div></td>' +
+      '<td>' + (u.active ? '<span class="badge b-done">active</span>' : '<span class="badge b-halt">disabled</span>') + (u.mustChange ? ' <span class="badge b-warn">temp pw</span>' : '') + '</td></tr>').join('') + '</tbody></table></div></div>';
+}
+function userModal(id) {
+  const u = id ? S.adm.users.find(x => x.id === id) : { role: 'user', active: true, steps: [] };
+  modal('<form data-form="user" data-id="' + (id || '') + '"><h2>' + (id ? 'Edit user' : 'Add user') + '</h2><p class="msub">Mobile numbers are shown in delay alerts so the coordinator can call.</p><div class="form-grid">' +
+    '<label class="fld"><span>Full name <i>*</i></span><input class="inp" name="name" value="' + esc(u.name || '') + '" required></label>' +
+    '<label class="fld"><span>Username <i>*</i></span><input class="inp mono" name="username" value="' + esc(u.username || '') + '" autocapitalize="none" required></label>' +
+    '<label class="fld"><span>Role</span><select class="inp" name="role">' + Object.keys(DEF.roles).map(r => '<option value="' + r + '"' + (u.role === r ? ' selected' : '') + '>' + DEF.roles[r] + '</option>').join('') + '</select></label>' +
+    '<label class="fld"><span>Mobile no.</span><input class="inp mono" name="mobile" type="tel" value="' + esc(u.mobile || '') + '" placeholder="+91…"></label>' +
+    '<label class="fld"><span>' + (id ? 'Reset password (optional)' : 'Password <i>*</i>') + '</span><input class="inp" name="password" type="text" autocomplete="off" placeholder="' + (id ? 'leave blank to keep' : 'min 6 characters') + '"' + (id ? '' : ' required') + '></label>' +
+    '<label class="fld"><span>Telegram chat id</span><input class="inp mono" name="telegramChatId" value="' + esc(u.telegramChatId || '') + '" placeholder="auto-filled when user links"></label>' +
+    '<div class="fld wide"><span>Assigned steps (a step can have many users)</span><div class="stepchips">' + DEF.stepKeys.map(k => '<label><input type="checkbox" name="steps" value="' + k + '"' + (u.steps.indexOf(k) >= 0 ? ' checked' : '') + '>' + esc(stepLabel(k)) + '</label>').join('') + '</div></div>' +
+    '<label class="chk"><input type="checkbox" name="active"' + (u.active ? ' checked' : '') + '> Active (can sign in)</label>' +
+    '</div><div class="note">New users and password resets get a temporary password — they must set their own at first sign-in.</div><div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">Save user</button></div></form>', 'wide');
+}
+function admWorkflow() {
+  const R = S.adm.rules, people = S.adm.users.filter(u => u.active && u.role !== 'admin');
+  const srcOpts = (k, r) => '<option value="after"' + (r.src === 'after' ? ' selected' : '') + '>' + (k === 'DOCS' ? 'Hours after dispatch (step 7)' : 'Hours after previous step is done') + '</option>' +
+    (k === 'DOCS' ? '' : DEF.deadlineFields.map(f => '<option value="field:' + f + '"' + (r.src === 'field' && r.field === f ? ' selected' : '') + '>Date: ' + esc(DEF.fields[f].l) + '</option>').join(''));
+  let h = '<form class="card" data-form="rules"><div class="card-h"><div><h3>Steps, deadlines & who does them</h3><span class="sub">Tap a name to assign / unassign instantly. Deadline changes apply after “Save deadlines”.</span></div><button class="btn btn-dark btn-sm">Save deadlines</button></div>';
+  DEF.stepKeys.forEach(k => {
+    const r = R[k];
+    h += '<div class="wf-row"><div class="wf-name">' + esc(stepLabel(k)) + '<small>' + (k === 'S1' ? 'Creates the booking — no deadline' : r ? '' : 'Maintained until file is closed — no deadline') + '</small></div><div>' +
+      (r ? '<div class="wf-rule"><select class="inp" name="src_' + k + '">' + srcOpts(k, r) + '</select><input class="inp mono" type="number" step="0.5" name="hrs_' + k + '" value="' + (r.hours || 0) + '"><span class="hint">hours ' + (r.src === 'field' ? '(+/- offset from that date)' : '') + '</span></div>' : '') +
+      '<div class="chips">' + people.map(u => '<button type="button" class="pill-t' + (u.steps.indexOf(k) >= 0 ? ' on' : '') + '" data-act="assign" data-k="' + k + '" data-u="' + u.id + '">' + esc(u.name) + '</button>').join('') + '</div></div></div>';
+  });
+  return h + '<div class="note" style="margin-top:12px;font-size:12px;color:var(--ink-soft)">Date-only fields (e.g. Allotment Date) count as due at 23:59 of that day. Admin can always act on every step.</div></form>';
+}
+function admAlerts() {
+  const s = S.adm.settings;
+  return '<form class="card" data-form="settings"><div class="card-h"><h3>Telegram bot</h3><span class="sub">' + (S.adm.tgSet ? '✓ Connected as @' + esc(s.botUsername) : 'Not connected') + '</span></div><div class="form-grid">' +
+    '<label class="fld wide"><span>Bot token (from @BotFather)</span><input class="inp mono" name="tg" type="password" autocomplete="new-password" placeholder="' + (S.adm.tgSet ? '•••••••• saved — paste a new one to replace' : '123456:ABC-DEF…') + '"></label>' +
+    '<label class="fld"><span>Remind assignee before deadline (hours)</span><input class="inp" type="number" step="0.5" min="0" name="remindBeforeHours" value="' + s.remindBeforeHours + '"></label>' +
+    '<label class="fld"><span>Repeat delay alert every (hours)</span><input class="inp" type="number" step="0.5" min="0.5" name="escalateRepeatHours" value="' + s.escalateRepeatHours + '"></label>' +
+    '<label class="fld"><span>Quiet hours start (0–23)</span><input class="inp" type="number" min="0" max="23" name="quietStart" value="' + s.quietStart + '"></label>' +
+    '<label class="fld"><span>Quiet hours end (0–23)</span><input class="inp" type="number" min="0" max="23" name="quietEnd" value="' + s.quietEnd + '"></label>' +
+    '<label class="chk"><input type="checkbox" name="notifyAdminOnDelay"' + (s.notifyAdminOnDelay ? ' checked' : '') + '> Also send delay alerts to admins</label>' +
+    '<label class="chk"><input type="checkbox" name="nudgeAssigneeOnOverdue"' + (s.nudgeAssigneeOnOverdue ? ' checked' : '') + '> Nudge the responsible person when overdue</label>' +
+    '</div><div class="act-foot"><span class="hint">Delay alerts go to Process Coordinators with the responsible person’s name & mobile.</span><button class="btn btn-dark">Save settings</button></div></form>' +
+    '<div class="card"><div class="card-h"><h3>Maintenance</h3></div><div class="chips">' +
+    '<button class="btn btn-ghost btn-sm" data-act="tgTest">Send test to me</button>' +
+    '<button class="btn btn-ghost btn-sm" data-act="runCheck">Run deadline check now</button>' +
+    '<button class="btn btn-ghost btn-sm" data-act="triggers">' + (S.adm.triggers ? '✓ Scheduler running — reinstall' : '⚠ Install scheduler') + '</button>' +
+    '<button class="btn btn-ghost btn-sm" data-act="clearCache">Reload data from sheet</button>' +
+    '<a class="btn btn-ghost btn-sm" href="' + esc(S.adm.sheetUrl) + '" target="_blank" rel="noopener">Open database sheet ↗</a></div>' +
+    '<div class="note">App link to share: <b class="mono">' + esc(S.adm.url || 'deploy as web app first') + '</b></div></div>';
+}
+
+/* ================================================================ events */
+const ACT = {
+  go: el => go(el.dataset.v),
+  menu: () => $('#side').classList.toggle('on'),
+  open: (el, e) => { e.preventDefault(); openDrawer(el.dataset.id, el.dataset.tab); },
+  closeDrawer: () => closeDrawer(),
+  dtab: async el => { if (S.edit && !(await confirmBox('Discard your unsaved changes?', 'Discard', true))) return; S.edit = null; S.dirty = false; S.dtab = el.dataset.t; renderDrawer(); $('#drawer').scrollTop = 0; },
+  newBooking: bookingModal,
+  profile: (el, e) => { e.preventDefault(); profileModal(); },
+  logout: () => { api('flushNotify', S.token).catch(() => {}); logout(); },
+  pw: () => pwModal(false),
+  mCancel: () => closeModal(),
+  mOk: () => resolveModal(true),
+  clearQ: () => { $('#q').value = ''; onSearch(); },
+  syncNow: () => doSync(true),
+  scrollPend: () => { const el = $('#pendCard'); if (el) el.scrollIntoView({ behavior: 'smooth' }); },
+  listOver: () => { S.lf.tab = 'ACTIVE'; S.lf.step = 'OVER'; LS.set('ct_lf', S.lf); go('list'); },
+  listActive: () => { S.lf.tab = 'ACTIVE'; S.lf.step = ''; LS.set('ct_lf', S.lf); go('list'); },
+  railGo: el => { S.lf.tab = 'ACTIVE'; S.lf.step = el.dataset.k; LS.set('ct_lf', S.lf); go('list'); },
+  lf: el => { S.lf[el.dataset.k] = el.dataset.k === 'group' ? !!el.dataset.v : el.dataset.v; S.limit = 120; LS.set('ct_lf', S.lf); renderView(); },
+  lfClear: () => { S.lf = { tab: S.lf.tab, from: '', to: '', step: '', group: S.lf.group, sort: S.lf.sort }; LS.set('ct_lf', S.lf); $('#q').value = ''; onSearch(); },
+  moreList: () => { S.limit += 200; renderView(); },
+  editStep: el => editStepModal(+el.dataset.n),
+  editSec: el => { S.edit = el.dataset.k; renderDrawer(); },
+  cancelEdit: () => { S.edit = null; S.dirty = false; renderDrawer(); },
+  addCont: async el => {
+    const c = S.C.get(S.open);
+    if (!(await confirmBox('Add one more container to booking ' + c.bookingNo + '?', 'Add container'))) return;
+    busy(el, true);
+    try { const r = await api('addContainer', S.token, c.bookingId); applyContainers(r.containers); kickNotify(); toast('Container added', 'ok'); refresh(); }
+    catch (e) { toast(e.message, 'err'); } finally { busy(el, false); }
+  },
+  linkFile: async el => {
+    const url = await promptBox('Attach a link', 'Paste a link to the document or photo (Google Drive, etc.).', 'https://…', { input: true, ok: 'Attach' });
+    if (url === null) return;
+    if (!/^https:\/\/\S+$/.test(url.trim())) return toast('Paste an https:// link.', 'err');
+    const ch = {}; ch[el.dataset.k] = url.trim(); submitChanges(S.open, ch);
+  },
+  setStatus: async el => {
+    const c = S.C.get(S.open), stt = el.dataset.s;
+    let note = '';
+    if (stt === 'CANCELLED') { note = await promptBox('Cancel container', 'Why is ' + label(c) + ' being cancelled?', 'Reason'); if (note === null) return; }
+    else if (stt === 'CLOSED' && !(await confirmBox('Close the file for ' + label(c) + '? It moves to the Closed list.', 'Close file'))) return;
+    try {
+      let r = await api('setStatus', S.token, c.id, stt, note, false);
+      if (r.confirm) { if (!(await confirmBox(r.confirm, 'Close anyway', true))) return; r = await api('setStatus', S.token, c.id, stt, note, true); }
+      applyContainers(r.containers); refresh(); toast('Status: ' + stt.toLowerCase(), 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+  },
+  decide: async el => {
+    const ok = !!el.dataset.ok;
+    let note = '';
+    if (!ok) { note = await promptBox('Reject change', 'Optional note for the requester.', 'Reason'); if (note === null) return; }
+    busy(el, true);
+    try { const r = await api('decideApproval', S.token, el.dataset.id, ok, note); applyContainers(r.containers); upsertAppr(r.approval); refresh(); kickNotify(); toast(ok ? 'Approved & applied' : 'Rejected', 'ok'); }
+    catch (e) { busy(el, false); toast(e.message, 'err'); }
+  },
+  withdraw: async el => {
+    try { const r = await api('withdrawApproval', S.token, el.dataset.id); upsertAppr(r.approval); refresh(); toast('Withdrawn'); } catch (e) { toast(e.message, 'err'); }
+  },
+  delRem: async el => {
+    try { S.rems = await api('deleteReminder', S.token, el.dataset.id); renderView(); } catch (e) { toast(e.message, 'err'); }
+  },
+  tgLink: async el => {
+    busy(el, true);
+    try {
+      const r = await api('tgLinkCode', S.token);
+      $('#tgBox').innerHTML = '<b>1.</b> Open <a href="' + esc(r.url) + '" target="_blank" rel="noopener">t.me/' + esc(r.bot) + '</a> and press <b>Start</b> (or send <span class="mono">/start ' + r.code + '</span>).<br><b>2.</b> Then tap “Check”.<div style="margin:10px 0"><span class="code">' + r.code + '</span></div>' +
+        '<div class="modal-foot" style="justify-content:flex-start;margin-top:4px"><a class="btn btn-amber btn-sm" href="' + esc(r.url) + '" target="_blank" rel="noopener">Open Telegram</a><button class="btn btn-dark btn-sm" data-act="tgCheck">Check</button></div>';
+    } catch (e) { busy(el, false); toast(e.message, 'err'); }
+  },
+  tgCheck: async el => {
+    busy(el, true);
+    try { const r = await api('tgCheck', S.token); busy(el, false); if (r.linked) { S.me.tg = true; persist(); renderNav(); profileModal(); toast('Telegram linked ✓', 'ok'); } else toast('Not received yet — press Start in the bot, then Check again.'); }
+    catch (e) { busy(el, false); toast(e.message, 'err'); }
+  },
+  tgTest: async el => { busy(el, true); try { await api('testTelegram', S.token, ''); toast('Test sent ✓', 'ok'); } catch (e) { toast(e.message, 'err'); } busy(el, false); },
+  atab: el => { S.atab = el.dataset.t; renderView(); },
+  userEdit: el => userModal(el.dataset.id),
+  assign: async el => {
+    const k = el.dataset.k, uid = el.dataset.u;
+    const ids = S.adm.users.filter(u => u.steps.indexOf(k) >= 0).map(u => u.id);
+    const want = ids.indexOf(uid) >= 0 ? ids.filter(x => x !== uid) : ids.concat([uid]);
+    el.classList.toggle('on');
+    try { S.adm = await api('setStepAssignees', S.token, k, want); syncUsersFromAdm(); toast('Assignment saved', 'ok'); }
+    catch (e) { el.classList.toggle('on'); toast(e.message, 'err'); }
+  },
+  runCheck: async el => { busy(el, true); try { const r = await api('adminRunCheck', S.token); toast('Checked: ' + r.alerts + ' alert group(s), ' + r.sent + ' message(s) sent', 'ok'); } catch (e) { toast(e.message, 'err'); } busy(el, false); },
+  triggers: async el => { busy(el, true); try { S.adm = await api('adminInstallTriggers', S.token); renderView(); toast('Scheduler installed ✓', 'ok'); } catch (e) { busy(el, false); toast(e.message, 'err'); } },
+  clearCache: async el => { busy(el, true); try { await api('adminClearCache', S.token); S.since = 0; await doSync(); toast('Reloaded from sheet ✓', 'ok'); } catch (e) { toast(e.message, 'err'); } busy(el, false); },
+  anPreset: el => { S.an.preset = el.dataset.v; renderView(); }
+};
+function syncUsersFromAdm() {
+  S.users = S.adm.users.map(u => ({ id: u.id, username: u.username, name: u.name, role: u.role, mobile: u.mobile, steps: u.steps, active: u.active, tg: !!u.telegramChatId }));
+  const me = S.users.find(u => u.id === S.me.id); if (me) { S.me.steps = me.steps; S.me.name = me.name; S.me.mobile = me.mobile; }
+  persist(); renderView(); renderNav();
+}
+
+const FORMS = {
+  step: f => submitStep(f),
+  booking: f => submitBooking(f),
+  prompt: f => { const v = String(f.elements.v.value || '').trim(); if (!v) { f.elements.v.classList.add('err'); return; } resolveModal(v); },
+  editFields: async f => {
+    const c = S.C.get(S.open), keys = f.dataset.keys.split(',');
+    const vals = readForm(f, keys, true); if (!vals) return;
+    const ch = diff(c, vals);
+    closeModal(true);
+    await submitChanges(c.id, ch);
+  },
+  section: async f => {
+    const c = S.C.get(S.open), k = f.dataset.k;
+    const keys = k === 'CHARGES' ? Array.from(f.elements).map(e => e.name).filter(n => n && DEF.fields[n]) : k === 'DOCS' ? ['sbNo', 'blNo'] : DEF.sections.find(s => s.key === k).fields;
+    const vals = readForm(f, keys, true); if (!vals) return;
+    const ch = diff(c, vals);
+    S.edit = null; S.dirty = false;
+    const ok = await submitChanges(c.id, ch);
+    if (!ok) { S.edit = k; }
+    renderDrawer();
+  },
+  pw: async f => {
+    const o = f.elements.o.value, n = f.elements.n.value, n2 = f.elements.n2.value;
+    if (n !== n2) return toast('New passwords do not match', 'err');
+    const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
+    try { const r = await api('changePassword', S.token, o, n); S.token = r.token; LS.set('ct_token', r.token); S.me.mustChange = false; persist(); closeModal(true); toast('Password updated ✓', 'ok'); }
+    catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  },
+  rem: async f => {
+    const text = f.elements.text.value.trim(), at = fromInput(f.elements.at.value, 'datetime'), cont = f.elements.cont.value.trim();
+    if (!text || !at) return toast('Fill the reminder text and time', 'err');
+    let containerId = '';
+    if (cont) { const c = Array.from(S.C.values()).find(x => (label(x) + ' · ' + x.bookingNo) === cont || x.containerNo === cont.toUpperCase() || x.bookingNo === cont.toUpperCase()); if (c) containerId = c.id; }
+    const btn = f.querySelector('button'); busy(btn, true);
+    try { S.rems = await api('saveReminder', S.token, { text: text, at: at, repeat: f.elements.repeat.value, containerId: containerId }); renderView(); toast('Reminder saved ✓', 'ok'); }
+    catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  },
+  user: async f => {
+    const d = { id: f.dataset.id || '', name: f.elements.name.value, username: f.elements.username.value, role: f.elements.role.value, mobile: f.elements.mobile.value,
+      password: f.elements.password.value.trim(), telegramChatId: f.elements.telegramChatId.value, active: f.elements.active.checked,
+      steps: $$('input[name=steps]:checked', f).map(x => x.value) };
+    const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
+    try { S.adm = await api('saveUserAdmin', S.token, d); closeModal(true); syncUsersFromAdm(); toast('User saved ✓', 'ok'); }
+    catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  },
+  rules: async f => {
+    const R = {};
+    Object.keys(S.adm.rules).forEach(k => {
+      const src = f.elements['src_' + k]; if (!src) return;
+      const v = src.value; R[k] = { src: v === 'after' ? 'after' : 'field', field: v.indexOf('field:') === 0 ? v.slice(6) : '', hours: Number(f.elements['hrs_' + k].value) || 0 };
+    });
+    const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
+    try { S.adm = await api('saveRules', S.token, R); S.rules = S.adm.rules; persist(); renderView(); toast('Deadlines saved ✓', 'ok'); }
+    catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  },
+  settings: async f => {
+    const s = {}; ['remindBeforeHours', 'escalateRepeatHours', 'quietStart', 'quietEnd'].forEach(k => s[k] = f.elements[k].value);
+    s.notifyAdminOnDelay = f.elements.notifyAdminOnDelay.checked; s.nudgeAssigneeOnOverdue = f.elements.nudgeAssigneeOnOverdue.checked;
+    const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
+    try { S.adm = await api('saveSettings', S.token, s, f.elements.tg.value.trim()); S.settings = S.adm.settings; renderView(); toast('Settings saved ✓', 'ok'); }
+    catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  }
+};
+
+let _qt = 0;
+function onSearch() {
+  const v = $('#q').value;
+  S.q = v.trim(); S.qTerms = S.q.toLowerCase().split(/\s+/).filter(Boolean);
+  $('#qx').hidden = !S.q; S.limit = 120;
+  if (['dash', 'list', 'appr'].indexOf(S.view) < 0) { S.view = 'list'; renderNav(); }
+  cancelAnimationFrame(_qt); _qt = requestAnimationFrame(renderView);
+}
+
+function bindEvents() {
+  document.addEventListener('click', e => {
+    const side = $('#side');
+    if (side.classList.contains('on') && !e.target.closest('#side') && !e.target.closest('[data-act=menu]')) side.classList.remove('on');
+    const el = e.target.closest('[data-act]');
+    if (!el || el.disabled) return;
+    const fn = ACT[el.dataset.act];
+    if (fn) { if (el.tagName === 'A' && el.getAttribute('href') === '#') e.preventDefault(); fn(el, e); }
+  });
+  document.addEventListener('submit', e => {
+    const f = e.target;
+    if (f.id === 'loginForm') { e.preventDefault(); return doLogin(f); }
+    const fn = FORMS[f.dataset.form];
+    if (fn) { e.preventDefault(); fn(f); }
+  });
+  document.addEventListener('change', e => {
+    const t = e.target;
+    if (t.matches('input[type=file][data-up]')) { uploadTo(S.open, t.dataset.up, t.files[0]); t.value = ''; return; }
+    if (t.dataset.lf) { S.lf[t.dataset.lf] = t.value; S.limit = 120; LS.set('ct_lf', S.lf); renderView(); return; }
+    if (t.dataset.an) { S.an[t.dataset.an] = t.value; renderView(); }
+  });
+  document.addEventListener('input', e => { if (e.target.closest('#drawer form')) S.dirty = true; });
+  document.addEventListener('error', e => {
+    const t = e.target;
+    if (t && t.tagName === 'IMG' && t.dataset.th) { const s = document.createElement('span'); s.className = 'fi'; s.textContent = '📄'; t.replaceWith(s); }
+  }, true);
+  $('#q').addEventListener('input', onSearch);
+  $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { if ($('#modal').classList.contains('on')) closeModal(); else if (S.open) closeDrawer(); }
+    if (e.key === '/' && document.activeElement === document.body) { e.preventDefault(); $('#q').focus(); }
+  });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.me && Date.now() - (S.lastSync || 0) > 15000) doSync(); });
+  setInterval(() => {
+    if (!S.me || document.visibilityState !== 'visible') return;
+    doSync();
+  }, 45000);
+}
+async function doLogin(f) {
+  const btn = $('#loginBtn'), err = $('#loginErr'); err.hidden = true; busy(btn, true);
+  try {
+    const r = await api('login', f.elements.u.value, f.elements.p.value);
+    S.token = r.token; LS.set('ct_token', r.token);
+    S.view = 'dash'; LS.set('ct_view', 'dash'); S.adm = null; S.rems = null; S.visits = null; S.hist = {};
+    ingest(r.boot); showApp(); render(); postBoot();
+    f.reset();
+  } catch (e) { err.textContent = e.message; err.hidden = false; }
+  busy(btn, false);
+}
+async function doSync(manual) {
+  if (S.syncing || !S.token) return;
+  S.syncing = 1;
+  try {
+    const p = await api('sync', S.token, S.since);
+    const changed = ingest(p);
+    S.lastSync = Date.now(); setSync('live');
+    refresh(true);
+    if (manual) toast(changed ? 'Updated' : 'Already up to date');
+  } catch (e) { setSync('off'); if (manual) toast(e.message, 'err'); }
+  finally { S.syncing = 0; }
+}
+
+start();
+})();
+</script>
