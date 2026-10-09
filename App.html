@@ -27,7 +27,6 @@ function human(ms) {
   if (h < 48) return h + 'h' + (h < 10 && m % 60 ? ' ' + (m % 60) + 'm' : '');
   return Math.floor(h / 24) + 'd' + (h % 24 ? ' ' + (h % 24) + 'h' : '');
 }
-function money(v) { return '₹ ' + Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 }); }
 function toInput(ms, t) {
   if (isEmpty(ms)) return '';
   const d = new Date(+ms), ds = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
@@ -44,7 +43,7 @@ function fmtV(k, v) {
   const f = DEF.fields[k] || {};
   if (f.t === 'date') return fmtD(v);
   if (f.t === 'datetime') return fmtDT(v);
-  if (f.t === 'money') return money(v);
+  if (f.t === 'money') return Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }); // currency lives in its own field
   return String(v);
 }
 function valHtml(k, v) {
@@ -63,6 +62,8 @@ const ICON = {
   dash: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>',
   list: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="12" rx="1.5"/><path d="M6 7v12M10 7v12M14 7v12M18 7v12M7 4h10"/></svg>',
   appr: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg>',
+  fu: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2"/></svg>',
+  nt: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 11 18-8-6 18-3-7z"/><path d="m12 14 9-11"/></svg>',
   rem: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg>',
   chart: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15v3M12 10v8M17 6v12"/></svg>',
   admin: '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6"/><path d="M19 8v6M16 11h6"/></svg>'
@@ -96,7 +97,7 @@ function matchQ(c) { for (const t of S.qTerms) if (c._s.indexOf(t) < 0) return f
 function ingest(p) {
   if (!p || p.same) { if (p) S.since = p.now; return false; }
   S.me = p.me; S.users = p.users; S.rules = p.rules; S.settings = p.settings; S.approvals = p.approvals || []; S.url = p.url || S.url;
-  if (p.full) S.C = new Map();
+  if (p.full) { S.C = new Map(); S.archived = false; }
   (p.containers || []).forEach(c => S.C.set(c.id, prep(c)));
   S.since = p.now;
   persist();
@@ -107,8 +108,18 @@ function persist() {
   clearTimeout(_pt);
   _pt = setTimeout(() => LS.set('ct_snap', {
     me: S.me, users: S.users, rules: S.rules, settings: S.settings, approvals: S.approvals, url: S.url, since: S.since,
-    containers: Array.from(S.C.values()).map(c => { const o = Object.assign({}, c); delete o._s; return o; })
+    containers: Array.from(S.C.values()).filter(c => ctHot(c, Date.now())).map(c => { const o = Object.assign({}, c); delete o._s; return o; })
   }), 500);
+}
+/** Load old closed/cancelled files once per session (memory only, never saved on the phone). */
+function loadArchive() {
+  if (S.archived) return S.archived === true ? Promise.resolve() : S.archP;
+  S.archived = 'loading';
+  return S.archP = api('getArchive', S.token).then(list => {
+    list.forEach(c => { if (!S.C.has(c.id)) S.C.set(c.id, prep(c)); });
+    S.archived = true;
+    if (['list', 'an'].indexOf(S.view) >= 0) renderView();
+  }).catch(e => { S.archived = false; toast(e.message, 'err'); });
 }
 function applyContainers(list) { (list || []).forEach(c => S.C.set(c.id, prep(c))); persist(); }
 function upsertAppr(a) { const i = S.approvals.findIndex(x => x.id === a.id); if (i >= 0) S.approvals[i] = a; else S.approvals.push(a); persist(); }
@@ -120,6 +131,7 @@ function api(fn) {
     google.script.run.withSuccessHandler(res).withFailureHandler(err => {
       const msg = String((err && err.message) || err).replace(/^(Exception|Error):\s*/, '');
       if (msg === 'AUTH') { logout(true); return rej(new Error('Your session has expired — please sign in again.')); }
+      if (/removed from the sheet/.test(msg)) setTimeout(() => doSync(), 300); // server reloaded → pull the fresh list now
       rej(new Error(msg));
     })[fn].apply(null, args);
   });
@@ -191,12 +203,13 @@ function start() {
 }
 function postBoot() {
   if (S.me && S.me.mustChange) pwModal(true);
-  if (DEEP && S.C.has(DEEP)) { openDrawer(DEEP); DEEP = ''; }
+  if (DEEP) { openDrawer(DEEP); DEEP = ''; }
 }
 function logout(expired) {
   S.token = null; S.me = null; S.C = new Map();
   LS.del('ct_token'); LS.del('ct_snap');
   closeModal(true); closeDrawer(true); showLogin();
+  $('#drawer').innerHTML = ''; $('#view').innerHTML = ''; S.fu = null; S.adm = null; // next user must not inherit this user's screens
   if (expired) { const e = $('#loginErr'); e.textContent = 'Session expired — please sign in again.'; e.hidden = false; }
 }
 
@@ -206,6 +219,8 @@ const VIEWS = {
   list: { t: 'Containers', nav: 'Containers', ic: 'list', ok: () => true },
   appr: { t: 'Change approvals', nav: 'Approvals', ic: 'appr', ok: () => true },
   rem: { t: 'My reminders', nav: 'Reminders', ic: 'rem', ok: () => true },
+  fu: { t: 'My follow-ups', nav: 'My follow-ups', ic: 'fu', ok: () => S.me.role === 'pc' },
+  nt: { t: 'Notify', nav: 'Notify', ic: 'nt', ok: isPC },
   an: { t: 'Analytics', nav: 'Analytics', ic: 'chart', ok: isPC },
   admin: { t: 'Admin panel', nav: 'Admin', ic: 'admin', ok: isAdmin }
 };
@@ -213,6 +228,7 @@ function go(v) {
   if (!VIEWS[v] || !VIEWS[v].ok()) v = 'dash';
   S.view = v; LS.set('ct_view', v); S.limit = 120;
   if (v === 'admin') S.adm = null; // refetch: a stale user form would overwrite a freshly linked Telegram chat id
+  if (v === 'fu') S.fu = null; // pick up follow-ups logged by other coordinators
   $('#side').classList.remove('on');
   render(); window.scrollTo(0, 0);
 }
@@ -227,12 +243,21 @@ function renderNav() {
   const myOver = pendingItems(false).filter(i => i.over).length;
   const badge = { dash: myOver, appr: pendAp };
   let h = '<div class="nav-label">Workspace</div>';
-  ['dash', 'list', 'appr', 'rem'].forEach(k => h += navItem(k, badge[k]));
+  ['dash', 'list', 'fu', 'nt', 'appr', 'rem'].filter(k => VIEWS[k].ok()).forEach(k => h += navItem(k, badge[k]));
   if (isPC()) { h += '<div class="nav-label">Insights</div>' + navItem('an'); }
   if (isAdmin()) h += navItem('admin');
   $('#nav').innerHTML = h;
   $('#meBox').innerHTML = '<div class="avatar">' + esc((S.me.name || '?').charAt(0)) + '</div><div style="min-width:0"><b>' + esc(S.me.name) + '</b>' + esc(DEF.roles[S.me.role] || '') + (S.me.tg ? ' · ✈︎' : '') + '</div>';
   $('#newBtn').hidden = !can('S1');
+  // phone: bottom tab bar + floating "+" (hidden on desktop by CSS)
+  const short = { dash: 'Home', list: 'Containers', appr: 'Approvals', rem: 'Reminders', fu: 'Follow-ups', nt: 'Notify' };
+  const more = isPC() ? '<button class="' + (S.view === 'an' || S.view === 'admin' ? 'on' : '') + '" data-act="menu">' + ICON.admin.replace('M19 8v6M16 11h6', 'M18 6h4M18 10h4M18 14h4') + 'More</button>'
+    : '<button data-act="profile">' + ICON.admin.replace('<path d="M19 8v6M16 11h6"/>', '') + 'Me</button>';
+  // PC: approvals move to "More" (admin decides them); admin: reminders move to "More"
+  $('#bnav').innerHTML = (VIEWS.fu.ok() ? ['dash', 'list', 'fu', 'nt'] : isAdmin() ? ['dash', 'list', 'appr', 'nt'] : ['dash', 'list', 'appr', 'rem']).map(k => '<button class="' + (S.view === k ? 'on' : '') + '" data-act="go" data-v="' + k + '">' +
+    ICON[VIEWS[k].ic] + short[k] + (badge[k] ? '<span class="nb">' + badge[k] + '</span>' : '') + '</button>').join('') + more;
+  $('#fab').hidden = !can('S1') || ['dash', 'list'].indexOf(S.view) < 0; // never cover a form's save button
+  $('#mMe').textContent = (S.me.name || '?').charAt(0);
 }
 function navItem(k, n) {
   const v = VIEWS[k];
@@ -245,12 +270,14 @@ function renderView() {
   const hr = new Date().getHours();
   $('#pageSub').textContent = v === 'dash' ? (hr < 12 ? 'Good morning' : hr < 17 ? 'Good afternoon' : 'Good evening') + ', ' + S.me.name + ' — here is what needs you.' :
     v === 'list' ? 'Every container pipeline, live.' : v === 'appr' ? 'Edits to already-filled details wait here for admin approval.' :
-    v === 'rem' ? 'Self reminders delivered to your Telegram.' : v === 'an' ? 'Throughput, delays and who/what is slowing things down.' : 'Users, steps, deadlines and alerts.';
+    v === 'rem' ? 'Self reminders delivered to your Telegram.' : v === 'fu' ? 'Every follow-up you logged, newest first.' : v === 'nt' ? 'Send Telegram messages now, later, or on repeat.' : v === 'an' ? 'Throughput, delays and who/what is slowing things down.' : 'Users, steps, deadlines and alerts.';
   const el = $('#view');
   if (v === 'dash') el.innerHTML = vDash();
   else if (v === 'list') el.innerHTML = vList();
   else if (v === 'appr') el.innerHTML = vAppr();
   else if (v === 'rem') el.innerHTML = vRem();
+  else if (v === 'fu') el.innerHTML = vFu();
+  else if (v === 'nt') el.innerHTML = vNt();
   else if (v === 'an') { el.innerHTML = vAn(); drawCharts(); }
   else if (v === 'admin') el.innerHTML = vAdmin();
 }
@@ -266,8 +293,8 @@ function pendingItems(all) {
   S.C.forEach(c => {
     if (c.status !== 'ACTIVE') return;
     const s = ctState(c, S.rules, now);
-    if (s.cur && (all || can('S' + s.cur))) out.push({ c: c, n: s.cur, key: 'S' + s.cur, name: DEF.steps[s.cur - 1].name, due: s.due, over: s.over });
-    if (s.docsNeeded && (all || can('DOCS'))) out.push({ c: c, n: 'D', key: 'DOCS', name: 'Shipping Bill & BL upload', due: s.docsDue, over: s.docsOver });
+    if (s.cur && (all || can('S' + s.cur))) out.push({ c: c, n: s.cur, key: 'S' + s.cur, name: DEF.byN[s.cur].name, due: s.due, over: s.over });
+    s.extra.forEach(x => { if (all || can(x.k)) out.push({ c: c, n: DEF.side[x.k][0], key: x.k, name: DEF.side[x.k][1], due: x.due, over: x.over }); });
   });
   return out.sort((a, b) => (b.over - a.over) || ((a.due || 9e15) - (b.due || 9e15)));
 }
@@ -283,7 +310,7 @@ function statusBadge(c) {
   if (c.status === 'CLOSED') return '<span class="badge b-done"><span class="d"></span>Closed</span>';
   if (c.status === 'CANCELLED') return '<span class="badge b-halt"><span class="d"></span>Cancelled</span>';
   const s = st(c);
-  if (s.over || s.docsOver) return '<span class="badge b-halt"><span class="d"></span>Delayed</span>';
+  if (s.anyOver) return '<span class="badge b-halt"><span class="d"></span>Delayed</span>';
   if (!s.cur) return '<span class="badge b-wait"><span class="d"></span>Gated-in</span>';
   return '<span class="badge b-active"><span class="d"></span>Active</span>';
 }
@@ -295,7 +322,7 @@ function vDash() {
   const act = Array.from(S.C.values()).filter(c => c.status === 'ACTIVE' && matchQ(c));
   const allOver = isPC() ? pendingItems(true).filter(i => i.over && matchQ(i.c)) : over;
   const bookings = new Set(act.map(c => c.bookingId)).size;
-  let h = '<div class="kpis">' +
+  let h = '<div class="dash"><div class="kpis">' +
     kpi('feature', 'My pending tasks', mine.length, over.length + ' overdue · ' + soon.length + ' due in 24h', 'scrollPend') +
     kpi(allOver.length ? 'bad' : '', isPC() ? 'Delayed (all users)' : 'My overdue', allOver.length, isPC() ? 'Steps past deadline right now' : 'Finish these first', 'listOver') +
     kpi('', 'Due in next 24h', soon.length, 'Across my steps', 'scrollPend') +
@@ -306,21 +333,22 @@ function vDash() {
   act.forEach(c => {
     const s = ctState(c, S.rules, now);
     if (s.cur) { cnt[s.cur] = (cnt[s.cur] || 0) + 1; if (s.over) bad[s.cur] = (bad[s.cur] || 0) + 1; }
-    if (s.docsNeeded) { cnt.D = (cnt.D || 0) + 1; if (s.docsOver) bad.D = (bad.D || 0) + 1; }
+    s.extra.forEach(x => { cnt[x.k] = (cnt[x.k] || 0) + 1; if (x.over) bad[x.k] = (bad[x.k] || 0) + 1; });
   });
-  h += '<div class="card"><div class="card-h"><h3>Pipeline right now</h3><span class="sub">Active containers waiting at each step · tap to filter</span></div><div class="rail">';
-  DEF.steps.slice(1).map(s => [s.n, s.short, 'S' + s.n]).concat([['D', 'SB & BL', 'DOCS']]).forEach(x => {
+  h += '<div class="card d-rail"><div class="card-h"><h3>Pipeline right now</h3><span class="sub">Active containers waiting at each step · tap to filter</span></div><div class="rail">';
+  DEF.flow.map(s => [s.n, s.short, 'S' + s.n, s.no]).concat([['DOCS', 'Inv, SB & BL', 'DOCS', 'DOC'], ['TRACK', 'Tracking', 'TRACK', 'TR'], ['CHARGES', 'Charges', 'CHARGES', 'CH']]).forEach(x => {
     const n = cnt[x[0]] || 0, b = bad[x[0]] || 0;
-    h += '<div class="rail-node" data-act="railGo" data-k="' + x[2] + '"><div class="rail-line"></div><div class="rail-dot ' + (b ? 'bad' : n ? 'has' : '') + '">' + (x[0] === 'D' ? '📄' : x[0]) +
+    h += '<div class="rail-node" data-act="railGo" data-k="' + x[2] + '"><div class="rail-line"></div><div class="rail-dot ' + (b ? 'bad' : n ? 'has' : '') + '">' + (x[3] || x[0]) +
       (n ? '<span class="cnt' + (b ? ' r' : '') + '">' + n + '</span>' : '') + '</div><div class="rail-name">' + esc(x[1]) + '</div></div>';
   });
   h += '</div></div>';
 
-  h += '<div class="row-2"><div class="card" id="pendCard"><div class="card-h"><h3>' + (isAdmin() ? 'All pending steps' : 'My pending tasks') + '</h3><span class="sub">Overdue first, then by deadline</span></div>' +
-    pendList(mine, 40, false) + '</div>';
-  if (isPC()) {
-    h += '<div class="card"><div class="card-h"><h3>Delayed — follow up</h3><span class="sub">Call the responsible person</span></div>' + pendList(allOver, 25, true) + '</div>';
+  if (isPC()) { // coordinator: delayed and upcoming kept apart, with who to call
+    h += '<div class="row-2"><div class="card" id="pendCard" style="border-color:#EFC2B6"><div class="card-h"><h3>🚨 Delayed containers (' + allOver.length + ')</h3><span class="sub">Past deadline — call the responsible person</span></div>' + pendList(allOver, 40, true) + '</div>' +
+      '<div class="card"><div class="card-h"><h3>⏳ Upcoming tasks</h3><span class="sub">Not due yet, soonest first</span></div>' + pendList(pendingItems(true).filter(i => !i.over && matchQ(i.c)), 40, true) + '</div>';
   } else {
+    h += '<div class="row-2"><div class="card" id="pendCard"><div class="card-h"><h3>My pending tasks</h3><span class="sub">Overdue first, then by deadline</span></div>' +
+      pendList(mine, 40, false) + '</div>';
     const recent = Array.from(S.C.values()).filter(matchQ).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 8);
     h += '<div class="card"><div class="card-h"><h3>Recently updated</h3></div>' + (recent.length ? '<div class="plist">' + recent.map(c => {
       const s = st(c);
@@ -328,17 +356,7 @@ function vDash() {
     }).join('') + '</div>' : '<div class="empty">Nothing yet.</div>') + '</div>';
   }
   h += '</div>';
-
-  // open files for tracking / charges owners
-  if (!isAdmin() && (can('TRACK') || can('CHARGES'))) {
-    const open = act.filter(c => c.s7_at).map(c => {
-      const miss = can('TRACK') ? DEF.sections[0].fields.filter(k => isEmpty(c[k])).length : 0;
-      return { c: c, miss: miss };
-    }).sort((a, b) => b.miss - a.miss);
-    h += '<div class="card" style="margin-top:16px"><div class="card-h"><h3>Open files — dispatched, not yet closed</h3><span class="sub">' + (can('TRACK') ? 'Shipment tracking details to maintain' : 'Record charges & proof photos') + '</span></div>' +
-      (open.length ? '<div class="tiles">' + open.slice(0, 30).map(o => tile(o.c, o.miss ? o.miss + ' tracking field' + (o.miss > 1 ? 's' : '') + ' empty' : '')).join('') + '</div>' : '<div class="empty">No dispatched containers open.</div>') + '</div>';
-  }
-  return h;
+  return h + '</div>';
 }
 function kpi(cls, lbl, val, sub, act) {
   return '<button class="kpi ' + cls + '" data-act="' + act + '"><div class="kpi-label">' + esc(lbl) + '</div><div class="kpi-val">' + val + '</div><div class="kpi-sub">' + esc(sub) + '</div></button>';
@@ -349,12 +367,13 @@ function pendList(items, lim, withCall) {
   return '<div class="plist">' + items.slice(0, lim).map(i => {
     const c = i.c;
     const who = withCall ? assignees(i.key) : [];
-    return '<div class="prow" data-act="open" data-id="' + c.id + '" data-tab="' + (i.key === 'DOCS' ? 'docs' : 'pipe') + '">' +
-      '<span class="snum ' + (i.over ? 'bad' : i.key === 'DOCS' ? 'doc' : '') + '">' + (i.key === 'DOCS' ? 'SB' : 'S' + i.n) + '</span>' +
+    const side = DEF.side[i.key];
+    return '<div class="prow" data-act="open" data-id="' + c.id + '" data-tab="' + ({ DOCS: 'docs', TRACK: 'track', CHARGES: 'chg' }[i.key] || 'pipe') + '">' +
+      '<span class="snum ' + (i.over ? 'bad' : side ? 'doc' : '') + '">' + (side ? side[0] : 'S' + DEF.byN[i.n].no) + '</span>' +
       '<div class="prow-main"><div class="t"><span class="mono">' + esc(c.containerNo || '#' + c.seq + '/' + (c.numContainers || '?')) + '</span> · ' + esc(c.bookingNo) + '</div>' +
       '<div class="s">' + esc(i.name) + ' · ' + esc(c.party || '') + '</div>' +
       (withCall ? '<div class="s">' + (who.length ? '📞 ' + who.map(callee).join(', ') : '<span style="color:var(--bad)">Nobody assigned</span>') + '</div>' : '') + '</div>' +
-      '<div class="prow-r">' + dueChip(i.due) + '</div></div>';
+      '<div class="prow-r">' + dueChip(i.due) + (isPC() ? '<button class="btn btn-ghost btn-sm" data-act="fu" data-id="' + c.id + '" data-k="' + i.key + '">📞 Log follow-up</button>' : '') + '</div></div>';
   }).join('') + '</div>' + more;
 }
 
@@ -369,8 +388,8 @@ function filteredContainers() {
     if (!matchQ(c)) return;
     if (f.step) {
       const s = ctState(c, S.rules, now);
-      if (f.step === 'OVER' && !(s.over || s.docsOver)) return;
-      if (f.step === 'DOCS' && !s.docsNeeded) return;
+      if (f.step === 'OVER' && !s.anyOver) return;
+      if (DEF.side[f.step] && !s.extra.some(x => x.k === f.step)) return;
       if (f.step === 'DONE' && s.cur) return;
       if (/^S\d+$/.test(f.step) && s.cur !== +f.step.slice(1)) return;
     }
@@ -386,18 +405,21 @@ function filteredContainers() {
 function vList() {
   const f = S.lf, counts = { ACTIVE: 0, CLOSED: 0, CANCELLED: 0, ALL: 0 };
   S.C.forEach(c => { counts[c.status || 'ACTIVE']++; counts.ALL++; });
-  const list = filteredContainers();
+  if (f.tab !== 'ACTIVE') loadArchive(); // older closed files only when someone looks for them
+  const list = filteredContainers(), nf = [f.from, f.to, f.step, f.group].filter(Boolean).length;
   let h = '<div class="ctrl-bar"><div class="seg">' + [['ACTIVE', 'Active'], ['CLOSED', 'Closed'], ['CANCELLED', 'Cancelled'], ['ALL', 'All']].map(t =>
     '<button class="' + (f.tab === t[0] ? 'on' : '') + '" data-act="lf" data-k="tab" data-v="' + t[0] + '">' + t[1] + '<span class="n">' + counts[t[0]] + '</span></button>').join('') + '</div>' +
+    '<button class="pill-t fbtn' + (S.fopen ? ' on' : '') + '" data-act="fopen">⚙ Filters' + (nf ? ' (' + nf + ')' : '') + '</button>' +
+    '<div class="fpanel' + (S.fopen ? ' on' : '') + '">' +
     '<label class="lbl">Booked from <input type="date" class="date-in" data-lf="from" value="' + esc(f.from) + '"></label>' +
     '<label class="lbl">to <input type="date" class="date-in" data-lf="to" value="' + esc(f.to) + '"></label>' +
     '<select class="sel" data-lf="step"><option value="">Any step</option><option value="OVER"' + (f.step === 'OVER' ? ' selected' : '') + '>⚠ Delayed only</option>' +
-    DEF.steps.slice(1).map(s => '<option value="S' + s.n + '"' + (f.step === 'S' + s.n ? ' selected' : '') + '>At S' + s.n + ' · ' + esc(s.short) + '</option>').join('') +
-    '<option value="DOCS"' + (f.step === 'DOCS' ? ' selected' : '') + '>SB / BL pending</option><option value="DONE"' + (f.step === 'DONE' ? ' selected' : '') + '>Gate-in done</option></select>' +
+    DEF.flow.map(s => '<option value="S' + s.n + '"' + (f.step === 'S' + s.n ? ' selected' : '') + '>At step ' + s.no + ' · ' + esc(s.short) + '</option>').join('') +
+    Object.keys(DEF.side).map(k => '<option value="' + k + '"' + (f.step === k ? ' selected' : '') + '>' + esc(DEF.side[k][1]) + ' pending</option>').join('') + '<option value="DONE"' + (f.step === 'DONE' ? ' selected' : '') + '>Gate-in done</option></select>' +
     '<select class="sel" data-lf="sort"><option value="new">Newest first</option><option value="due"' + (f.sort === 'due' ? ' selected' : '') + '>Most urgent</option><option value="no"' + (f.sort === 'no' ? ' selected' : '') + '>Container no.</option></select>' +
     '<button class="pill-t' + (f.group ? ' on' : '') + '" data-act="lf" data-k="group" data-v="' + (f.group ? '' : '1') + '">Group by booking</button>' +
-    ((f.from || f.to || f.step || S.q) ? '<button class="btn btn-ghost btn-sm" data-act="lfClear">Clear filters</button>' : '') +
-    '<span class="tl-time" style="margin-left:auto">' + list.length + ' container' + (list.length === 1 ? '' : 's') + '</span></div>';
+    ((f.from || f.to || f.step || S.q) ? '<button class="btn btn-ghost btn-sm" data-act="lfClear">Clear filters</button>' : '') + '</div>' +
+    '<span class="tl-time count" style="margin-left:auto">' + list.length + ' container' + (list.length === 1 ? '' : 's') + (S.archived === 'loading' ? ' · loading older files…' : '') + '</span></div>';
   if (!list.length) return h + '<div class="card"><div class="empty"><b>No containers match.</b>Try another tab, date range or search.</div></div>';
   const shown = list.slice(0, S.limit);
   if (f.group) {
@@ -413,20 +435,21 @@ function vList() {
   return h;
 }
 function tile(c, note) {
-  const s = st(c), cls = (s.over || s.docsOver) ? ' over' : c.status !== 'ACTIVE' ? ' closed' : '';
+  const s = st(c), cls = s.anyOver ? ' over' : c.status !== 'ACTIVE' ? ' closed' : '', x0 = s.extra[0];
   let rail = '';
-  for (let n = 1; n <= 10; n++) {
-    const at = c['s' + n + '_at'], due = c['s' + n + '_due'];
-    rail += '<i class="' + (at ? (due && at > due ? 'l' : 'd') : n === s.cur ? (s.over ? 'x' : 'c') : '') + '"></i>';
-  }
+  DEF.flow.forEach(step => {
+    const n = step.n, at = c['s' + n + '_at'], due = c['s' + n + '_due'];
+    rail += '<i class="' + (ctStepDone(c, step) ? (due && at > due ? 'l' : 'd') : n === s.cur ? (s.over ? 'x' : 'c') : '') + '"></i>';
+  });
   const stepTxt = c.status !== 'ACTIVE' ? (c.status === 'CLOSED' ? 'File closed ' + fmtD(c.statusAt) : 'Cancelled') :
-    s.cur ? 'S' + s.cur + ' · ' + DEF.steps[s.cur - 1].short : (s.docsNeeded ? 'SB / BL pending' : 'Gate-in done');
+    s.cur ? 'Step ' + DEF.byN[s.cur].no + ' · ' + DEF.byN[s.cur].short : x0 ? s.extra.map(x => DEF.side[x.k][0]).join(' · ') + ' pending' : 'Gate-in done';
   return '<button class="ctile' + cls + '" data-act="open" data-id="' + c.id + '">' +
     '<div class="ct-top"><div class="ct-no ' + (c.containerNo ? 'mono' : 'na') + '">' + esc(c.containerNo || 'Not allotted yet') + '</div>' + statusBadge(c) + '</div>' +
     '<div class="ct-sub"><b class="mono">' + esc(c.bookingNo) + '</b> · #' + c.seq + '/' + (c.numContainers || '?') + ' · ' + esc(c.line || '') + '</div>' +
     '<div class="ct-sub">' + esc(c.party || '') + ' → ' + esc(c.destination || '') + '</div>' +
     '<div class="mrail">' + rail + '</div>' +
-    '<div class="ct-foot"><span class="st">' + esc(note || stepTxt) + '</span>' + (c.status === 'ACTIVE' ? (s.cur ? dueChip(s.due) : s.docsNeeded ? dueChip(s.docsDue) : '') : '') + '</div></button>';
+    '<div class="ct-foot"><span class="st">' + esc(note || stepTxt) + '</span>' + (c.status === 'ACTIVE' ? (s.cur ? dueChip(s.due) : x0 ? dueChip(Math.min.apply(null, s.extra.map(x => x.due))) : '') : '') + '</div>' +
+    (isPC() && c.status === 'ACTIVE' ? '<span class="fu-b" role="button" data-act="fu" data-id="' + c.id + '">📞 Log follow-up</span>' : '') + '</button>';
 }
 
 /* ================================================================ approvals view */
@@ -470,6 +493,113 @@ function vRem() {
   }
   return h + '</div></div>';
 }
+/* ================================================================ PC follow-ups (admin + PC only) */
+function loadFu() {
+  if (S.fu || S.fuP || !isPC()) return;
+  S.fuP = api('listFollowups', S.token).then(l => {
+    S.fu = l; S.fuP = null;
+    if (S.view === 'fu') renderView();
+    if (S.open && S.dtab === 'hist') renderDrawer();
+  }).catch(e => { S.fuP = null; toast(e.message, 'err'); });
+}
+function fuCard(f) {
+  return '<div class="fu-card"><div class="fu-top"><b>' + fmtDT(f.createdAt) + '</b><span class="badge b-wait">' + esc(stepLabel(f.step)) + '</span></div>' +
+    '<div class="tl-time"><a href="#" data-act="open" data-id="' + esc(f.containerId) + '" class="mono">' + esc(f.containerLabel) + '</a> · Booking ' + esc(f.bookingNo) + '</div>' +
+    (f.person ? '<div class="fu-p">📞 Spoke to <b>' + esc(f.person) + '</b></div>' : '') +
+    '<div class="fu-said">“' + esc(f.said) + '”</div>' +
+    (f.remindAt ? '<div class="fu-r">⏰ ' + fmtDT(f.remindAt) + ' — ' + esc(f.remindText) + '</div>' : '') +
+    '<div class="tl-time">Logged by ' + esc(f.byName) + '</div></div>';
+}
+function fuRange(p) {
+  const d = new Date(), t0 = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  if (p.preset === 'today') return [t0, t0 + 864e5];
+  if (p.preset === 'yesterday') return [t0 - 864e5, t0];
+  if (p.preset === 'month') return [new Date(d.getFullYear(), d.getMonth(), 1).getTime(), t0 + 864e5];
+  if (p.preset === 'range') return [dayStart(p.from) || 0, p.to ? dayStart(p.to) + 864e5 : 9e15];
+  return [0, 9e15];
+}
+function vFu() {
+  loadFu();
+  const p = S.fuf = S.fuf || { preset: 'today', from: '', to: '', person: '', step: '' };
+  const mine = (S.fu || []).filter(f => f.byId === S.me.id);
+  const opt = (vals, cur, lbl) => '<option value="">All</option>' + vals.map(v => '<option value="' + esc(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(lbl ? lbl(v) : v) + '</option>').join('');
+  let h = '<div class="ctrl-bar"><div class="seg">' + [['today', 'Today'], ['yesterday', 'Yesterday'], ['month', 'Month'], ['all', 'All time'], ['range', 'Dates']].map(x =>
+    '<button class="' + (p.preset === x[0] ? 'on' : '') + '" data-act="fuPreset" data-v="' + x[0] + '">' + x[1] + '</button>').join('') + '</div>' +
+    '<div class="fbar">' + (p.preset === 'range' ? '<label>From<input type="date" class="date-in" data-fuf="from" value="' + esc(p.from) + '"></label><label>To<input type="date" class="date-in" data-fuf="to" value="' + esc(p.to) + '"></label>' : '') +
+    '<label>Person contacted<select class="sel" data-fuf="person">' + opt(Array.from(new Set(mine.map(f => f.person).filter(Boolean))).sort(), p.person) + '</select></label>' +
+    '<label>Step<select class="sel" data-fuf="step">' + opt(DEF.stepKeys.filter(k => mine.some(f => f.step === k)), p.step, stepLabel) + '</select></label></div></div>';
+  if (!S.fu) return h + '<div class="card"><div class="empty"><span class="spin"></span></div></div>';
+  const [a, b] = fuRange(p);
+  const list = mine.filter(f => f.createdAt >= a && f.createdAt < b && (!p.person || f.person === p.person) && (!p.step || f.step === p.step) &&
+    S.qTerms.every(t => (f.containerLabel + ' ' + f.bookingNo + ' ' + f.person + ' ' + f.said).toLowerCase().indexOf(t) >= 0)).sort((x, y) => y.createdAt - x.createdAt);
+  const uniq = k => new Set(list.map(f => f[k]).filter(Boolean)).size;
+  h += '<div class="kpi-strip kpi4"><div class="kpi feature"><div class="kpi-label">Follow-ups</div><div class="kpi-val">' + list.length + '</div></div>' +
+    '<div class="kpi"><div class="kpi-label">Containers</div><div class="kpi-val">' + uniq('containerId') + '</div></div>' +
+    '<div class="kpi"><div class="kpi-label">People</div><div class="kpi-val">' + uniq('person') + '</div></div>' +
+    '<div class="kpi"><div class="kpi-label">Reminders</div><div class="kpi-val">' + list.filter(f => f.remindAt).length + '</div></div></div>';
+  return h + (list.length ? '<div class="tiles">' + list.map(fuCard).join('') + '</div>' : '<div class="card"><div class="empty"><b>No follow-ups in this period.</b>Tap “📞 Log follow-up” on any container.</div></div>');
+}
+function personOpts(k) {
+  const who = assignees(k), list = who.length ? who : S.users.filter(u => u.active && u.role !== 'admin');
+  return (who.length ? '' : '<option value="">— nobody assigned to this step; pick anyone —</option>') + list.map(u => '<option>' + esc(u.name) + '</option>').join('');
+}
+function fuModal(id, key) {
+  const c = S.C.get(id); if (!c) return;
+  const s = st(c), cur = s.cur ? 'S' + s.cur : s.extra[0] ? s.extra[0].k : 'S10', step = key || cur;
+  modal('<form data-form="fu" data-id="' + esc(id) + '"><h2>📞 Log follow-up</h2><p class="msub"><b class="mono">' + esc(label(c)) + '</b> · Booking ' + esc(c.bookingNo) + ' · ' + esc(c.party || '') + '</p><div class="form-grid">' +
+    '<label class="fld wide"><span>Follow-up for step</span><select class="inp" name="step">' + DEF.stepKeys.map(k => '<option value="' + k + '"' + (k === step ? ' selected' : '') + '>' + esc(stepLabel(k)) + (k === cur ? '  (current)' : '') + '</option>').join('') + '</select></label>' +
+    '<label class="fld wide"><span>Person contacted</span><select class="inp" name="person">' + personOpts(step) + '</select></label>' +
+    '<label class="fld wide"><span>What did they say? <i>*</i></span><textarea class="inp" name="said" rows="3" placeholder="e.g. Container will reach factory by 4 pm, driver on the way"></textarea></label>' +
+    '<label class="chk wide"><input type="checkbox" name="rem"> ⏰ Set a reminder for me</label>' +
+    '<div class="fu-rem wide"><label class="fld"><span>Remind me at</span><input class="inp" type="datetime-local" name="at" value="' + toInput(Date.now() + 3600e3, 'datetime') + '"></label>' +
+    '<label class="fld"><span>What do you have to do then?</span><textarea class="inp" name="todo" rows="2" placeholder="e.g. Call Harish Ji again to confirm gate-in"></textarea></label></div>' +
+    '</div><div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">Save follow-up</button></div></form>', 'wide');
+}
+
+/* ================================================================ Notify (PC / admin → user Telegram) */
+const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function ntWhen(n) {
+  if (n.kind === 'direct') return 'Sent ' + fmtDT(n.lastSent);
+  if (n.kind === 'scheduled') return n.active ? 'Scheduled for ' + fmtDT(n.at) : 'Sent ' + fmtDT(n.lastSent);
+  const f = n.freq === 'daily' ? 'Every day' : n.freq === 'weekly' ? 'Every ' + String(n.days).split(',').map(x => WD[x]).join(', ') : 'Monthly on day ' + n.dom;
+  return f + ' at ' + n.time + (n.active && n.at ? ' · next ' + fmtDT(n.at) : '') + (n.sentCount ? ' · sent ' + n.sentCount + '×' : '');
+}
+function ntCard(n) {
+  const kb = { direct: ['b-done', 'Direct'], scheduled: ['b-wait', 'Scheduled'], auto: ['b-active', 'Auto-reminder'] }[n.kind];
+  return '<div class="fu-card"><div class="fu-top"><b>To ' + esc(n.toName) + '</b><span class="badge ' + kb[0] + '">' + kb[1] + '</span></div>' +
+    '<div class="tl-time">' + esc(ntWhen(n)) + (isAdmin() && n.byId !== S.me.id ? ' · by ' + esc(n.byName) : '') + '</div>' +
+    '<div class="fu-said">“' + esc(n.text) + '”</div>' + (n.note ? '<div class="pendchg">' + esc(n.note) + '</div>' : '') +
+    (n.active ? '<div class="chips"><button class="btn btn-ghost btn-sm" data-act="ntEdit" data-id="' + n.id + '">✎ Edit</button><button class="btn btn-bad btn-sm" data-act="ntStop" data-id="' + n.id + '">Stop</button></div>' : '') + '</div>';
+}
+function vNt() {
+  if (!S.nts && !S.ntP) S.ntP = api('listNotices', S.token).then(l => { S.nts = l; S.ntP = null; if (S.view === 'nt') renderView(); }).catch(e => { S.ntP = null; toast(e.message, 'err'); });
+  const e = S.nEdit && S.nts && S.nts.find(n => n.id === S.nEdit), kind = e ? e.kind : 'direct';
+  const users = S.users.filter(u => u.active && u.id !== S.me.id);
+  const days = e && e.days ? String(e.days).split(',').map(Number) : [1, 2, 3, 4, 5];
+  let h = '<form class="card" data-form="nt"><div class="card-h"><h3>' + (e ? '✎ Edit notification' : 'New notification') + '</h3>' + (e ? '<button type="button" class="btn btn-ghost btn-sm" data-act="ntCancel">Cancel edit</button>' : '') + '</div><div class="form-grid">' +
+    '<label class="fld wide"><span>Notify <i>*</i></span><select class="inp" name="to"><option value="">Select a person…</option>' +
+    users.map(u => '<option value="' + u.id + '"' + (e && e.toId === u.id ? ' selected' : '') + (u.tg ? '' : ' disabled') + '>' + esc(u.name) + ' — ' + esc(DEF.roles[u.role]) + (u.tg ? '' : ' (Telegram not linked)') + '</option>').join('') + '</select></label>' +
+    '<div class="fld wide"><span>Type</span><div class="seg nt-kind">' + [['direct', 'Direct'], ['scheduled', 'Scheduled'], ['auto', 'Auto-reminder']].map(k =>
+      '<label><input type="radio" name="kind" value="' + k[0] + '"' + (kind === k[0] ? ' checked' : '') + '><span>' + k[1] + '</span></label>').join('') + '</div></div>' +
+    '<label class="fld wide nt-at"><span>Send at <i>*</i></span><input class="inp" type="datetime-local" name="at" value="' + toInput(e && e.kind === 'scheduled' ? e.at : Date.now() + 3600e3, 'datetime') + '"></label>' +
+    '<div class="nt-auto wide"><label class="fld"><span>How often</span><select class="inp" name="freq">' + [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly']].map(f =>
+      '<option value="' + f[0] + '"' + (e && e.freq === f[0] ? ' selected' : '') + '>' + f[1] + '</option>').join('') + '</select></label>' +
+    '<label class="fld"><span>Time</span><input class="inp" type="time" name="time" value="' + esc(e && e.time ? ('0' + e.time).slice(-5) : '09:30') + '"></label>' +
+    '<div class="fld wide nt-days"><span>Days</span><div class="stepchips">' + WD.map((d, i) => '<label><input type="checkbox" name="days" value="' + i + '"' + (days.indexOf(i) >= 0 ? ' checked' : '') + '>' + d + '</label>').join('') + '</div></div>' +
+    '<label class="fld nt-dom"><span>Date of month</span><select class="inp" name="dom">' + Array.from({ length: 31 }, (_, i) => '<option' + (e && +e.dom === i + 1 ? ' selected' : '') + '>' + (i + 1) + '</option>').join('') + '</select></label></div>' +
+    '<label class="fld wide"><span>Message <i>*</i></span><textarea class="inp" name="text" rows="3" maxlength="2000" placeholder="Type what they should know…">' + esc(e ? e.text : '') + '</textarea></label>' +
+    '<p class="hint wide">Arrives on Telegram as: <b>' + (isAdmin() ? 'ADMIN' : 'Process Coordinator') + '</b> : "your message"</p>' +
+    '</div><div class="act-foot"><span class="hint nt-hint">Scheduled & repeating messages go out within 5 minutes of the set time.</span>' +
+    '<button class="btn btn-dark"><span class="k-direct">Send now</span><span class="k-scheduled">Schedule</span><span class="k-auto">' + (e ? 'Save changes' : 'Start auto-reminder') + '</span></button></div></form>';
+  const tab = S.ntTab || 'active', list = (S.nts || []).filter(n => (tab === 'active') === !!n.active)
+    .sort((a, b) => tab === 'active' ? (a.at || 0) - (b.at || 0) : (b.lastSent || b.createdAt) - (a.lastSent || a.createdAt));
+  const cnt = t => (S.nts || []).filter(n => (t === 'active') === !!n.active).length;
+  h += '<div class="ctrl-bar" style="margin-top:16px"><div class="seg">' + [['active', 'Active'], ['done', 'Completed']].map(t =>
+    '<button class="' + (tab === t[0] ? 'on' : '') + '" data-act="ntTab" data-v="' + t[0] + '">' + t[1] + '<span class="n">' + cnt(t[0]) + '</span></button>').join('') + '</div></div>';
+  if (!S.nts) return h + '<div class="card"><div class="empty"><span class="spin"></span></div></div>';
+  return h + (list.length ? '<div class="tiles">' + list.map(ntCard).join('') + '</div>' : '<div class="card"><div class="empty">' + (tab === 'active' ? 'No scheduled or repeating notifications.' : 'Nothing sent yet.') + '</div></div>');
+}
+
 function remRow(r) {
   const c = r.containerId && S.C.get(r.containerId);
   return '<div class="rem"><span class="snum">' + (r.repeat === 'daily' ? 'D' : r.repeat === 'weekly' ? 'W' : '1') + '</span><div class="b"><div class="t">' + esc(r.text) + '</div><div class="m">' +
@@ -479,7 +609,11 @@ function remRow(r) {
 
 /* ================================================================ drawer */
 function openDrawer(id, tab) {
-  if (!S.C.has(id)) return toast('Container not found', 'err');
+  if (!S.C.has(id)) {
+    if (S.archived === true) return toast('Container not found', 'err');
+    toast('Opening older file…');
+    return loadArchive().then(() => { if (S.C.has(id)) openDrawer(id, tab); else toast('Container not found', 'err'); });
+  }
   const same = S.open === id;
   if (!same) { S.dirty = false; S.edit = null; }
   S.dtab = tab || (same && S.dtab) || 'pipe';
@@ -498,7 +632,8 @@ function renderDrawer() {
   if (!c) return closeDrawer(true);
   const d = $('#drawer'), top = d.scrollTop, s = st(c);
   const chTotal = chargeTotal(c);
-  const tabs = [['pipe', 'Pipeline'], ['track', 'Tracking'], ['docs', 'SB & BL' + (s.docsNeeded ? ' <span class="n">!</span>' : '')], ['chg', 'Charges' + (chTotal ? ' <span class="n">' + money(chTotal).replace('₹ ', '₹') + '</span>' : '')], ['hist', 'History']];
+  const bang = k => s.extra.some(x => x.k === k) ? ' <span class="n">!</span>' : '';
+  const tabs = [['pipe', 'Pipeline'], ['track', 'Tracking' + bang('TRACK')], ['docs', 'Inv/SB/BL' + bang('DOCS')], ['chg', 'Charges' + bang('CHARGES') + (someCur(chTotal) ? ' <span class="n chgn">' + someCur(chTotal).replace(/ (?=\d)/g, '') + '</span>' : '')], ['hist', 'History']];
   let h = '<div class="dr-head"><button class="dr-close" data-act="closeDrawer" aria-label="Close">✕</button>' +
     '<div class="dr-t"><div class="dr-slab mono">' + esc(label(c)) + '</div>' + statusBadge(c) + '</div>' +
     '<div class="dr-meta"><span>Booking <b class="mono">' + esc(c.bookingNo) + '</b> (#' + c.seq + '/' + (c.numContainers || '?') + ')</span><span>Party <b>' + esc(c.party || '—') + '</b></span>' +
@@ -511,34 +646,39 @@ function renderDrawer() {
   else if (S.dtab === 'chg') h += tabCharges(c);
   else h += tabHist(c);
   d.innerHTML = h + '</div>';
+  $$('[data-dt]', d).forEach(syncDt); // disable past hours/minutes in step forms
   d.scrollTop = top;
 }
 
 function tabPipe(c, s) {
   let h = '';
-  if (isAdmin()) {
-    h += '<div class="admin-bar">' + (c.status === 'ACTIVE' ?
-      '<button class="btn btn-dark btn-sm" data-act="setStatus" data-s="CLOSED">Close file</button><button class="btn btn-bad btn-sm" data-act="setStatus" data-s="CANCELLED">Cancel container</button>' :
-      '<button class="btn btn-ghost btn-sm" data-act="setStatus" data-s="ACTIVE">Reopen</button>') + '</div>';
+  if (isPC()) {
+    const n = S.fu ? S.fu.filter(f => f.containerId === c.id).length : 0;
+    h += '<div class="admin-bar"><button class="btn btn-amber btn-sm" data-act="fu" data-id="' + c.id + '">📞 Log follow-up</button>' +
+      '<button class="btn btn-ghost btn-sm" data-act="dtab" data-t="hist">Follow-up history' + (n ? ' (' + n + ')' : '') + '</button></div>';
   }
   if (c.status !== 'ACTIVE') h += '<div class="act wait"><b>' + (c.status === 'CLOSED' ? 'File closed' : 'Cancelled') + '</b> by ' + esc(c.statusBy || '') + ' on ' + fmtDT(c.statusAt) + (c.statusNote ? '<div class="tl-time" style="margin-top:4px">“' + esc(c.statusNote) + '”</div>' : '') + '</div>';
   h += actionCard(c, s);
-  if (s.docsNeeded && can('DOCS')) h += '<div class="act ' + (s.docsOver ? 'bad' : '') + '"><div class="act-h"><h4><span class="snum doc">SB</span>Shipping Bill & BL are mandatory now</h4>' + dueChip(s.docsDue) + '</div><button class="btn btn-dark btn-sm" data-act="dtab" data-t="docs">Fill Shipping Bill & BL →</button></div>';
+  s.extra.filter(x => can(x.k)).forEach(x => { // follow-on tasks this user is responsible for
+    const t = { DOCS: 'docs', TRACK: 'track', CHARGES: 'chg' }[x.k];
+    h += '<div class="act ' + (x.over ? 'bad' : '') + '"><div class="act-h"><h4><span class="snum doc">' + DEF.side[x.k][0] + '</span>' + esc(DEF.side[x.k][1]) + ' — required now</h4>' + dueChip(x.due) + '</div>' +
+      '<button class="btn btn-dark btn-sm" data-act="dtab" data-t="' + t + '">Open ' + esc(DEF.side[x.k][1]) + ' →</button></div>';
+  });
 
   // timeline
   h += '<div class="dr-sec-t">Process</div><div class="tl">';
-  DEF.steps.forEach(step => {
-    const n = step.n, at = c['s' + n + '_at'], dueSnap = c['s' + n + '_due'];
-    const isCur = n === s.cur, due = at ? dueSnap : isCur ? s.due : (n > 1 ? ctDue(c, n, S.rules) : null);
-    const late = at && dueSnap && at > dueSnap;
-    const dot = at ? (late ? 'late' : 'done') : isCur ? (s.over ? 'over' : 'active') : 'pending';
+  DEF.flow.forEach(step => {
+    const n = step.n, at = c['s' + n + '_at'], dueSnap = c['s' + n + '_due'], fin = ctStepDone(c, step);
+    const isCur = n === s.cur, due = fin ? dueSnap : isCur ? s.due : (n > 1 ? ctDue(c, n, S.rules) : null);
+    const late = fin && dueSnap && at > dueSnap;
+    const dot = fin ? (late ? 'late' : 'done') : isCur ? (s.over ? 'over' : 'active') : 'pending';
     const vals = step.fields.filter(k => !isEmpty(c[k]) || pendAppr(c.id, k));
     const canEdit = at && can(step.key) && editable(c) && step.fields.some(k => !DEF.fields[k].ro);
-    h += '<div class="tl-node"><div class="tl-dot ' + dot + '">' + (at ? '✓' : n) + '</div><div class="tl-card ' + (at ? '' : isCur ? 'active' : 'pending') + '">' +
-      '<div class="tl-top"><div class="tl-stage">' + n + '. ' + esc(step.name) + '</div><div style="display:flex;gap:6px;align-items:center">' +
+    h += '<div class="tl-node"><div class="tl-dot ' + dot + '">' + (fin ? '✓' : step.no) + '</div><div class="tl-card ' + (fin ? '' : isCur ? 'active' : 'pending') + '">' +
+      '<div class="tl-top"><div class="tl-stage">' + step.no + '. ' + esc(step.name) + '</div><div style="display:flex;gap:6px;align-items:center">' +
       (late ? '<span class="badge b-warn">Late ' + human(at - dueSnap) + '</span>' : '') + (isCur && c.status === 'ACTIVE' ? dueChip(due) : '') +
       (canEdit ? '<button class="icon-btn" title="Edit" data-act="editStep" data-n="' + n + '">✎</button>' : '') + '</div></div>' +
-      '<div class="tl-time">' + (at ? 'Done ' + fmtDT(at) + ' by ' + esc(c['s' + n + '_by'] || '') : 'Pending') + (due ? ' · deadline ' + fmtDT(due) : '') + '</div>' +
+      '<div class="tl-time">' + (at ? 'Done ' + fmtDT(at) + ' by ' + esc(c['s' + n + '_by'] || '') + (fin ? '' : ' · S.I / gate-in cut-offs missing') : 'Pending') + (due ? ' · deadline ' + fmtDT(due) : '') + '</div>' +
       (vals.length ? '<div class="tl-fields">' + vals.map(k => {
         const p = pendAppr(c.id, k);
         return '<span class="chip">' + esc(DEF.fields[k].l) + ': <b>' + valHtml(k, c[k]) + '</b>' + (p ? ' <span class="pendchg">⏳ ' + esc(fmtV(k, p.newValue)) + '</span>' : '') + '</span>';
@@ -550,6 +690,12 @@ function tabPipe(c, s) {
   const sib = Array.from(S.C.values()).filter(o => o.bookingId === c.bookingId).sort((a, b) => a.seq - b.seq);
   h += '<div class="dr-sec-t">Containers in booking ' + esc(c.bookingNo) + (can('S1') && c.status === 'ACTIVE' ? '<button class="btn btn-ghost btn-sm" data-act="addCont">+ Add container</button>' : '') + '</div><div class="chips">' +
     sib.map(o => '<button class="pill-t' + (o.id === c.id ? ' on' : '') + '" data-act="open" data-id="' + o.id + '">#' + o.seq + ' ' + esc(o.containerNo || '') + (o.status !== 'ACTIVE' ? ' · ' + o.status.toLowerCase() : '') + '</button>').join('') + '</div>';
+  if (isAdmin()) { // file-level actions live at the very bottom, away from day-to-day buttons
+    h += '<div class="dr-sec-t">File</div><div class="admin-bar">' + (c.status === 'ACTIVE' ?
+      '<button class="btn btn-dark btn-sm" data-act="setStatus" data-s="CLOSED">Close file</button><button class="btn btn-bad btn-sm" data-act="setStatus" data-s="CANCELLED">Cancel container</button>' :
+      '<button class="btn btn-ghost btn-sm" data-act="setStatus" data-s="ACTIVE">Reopen</button>') + '</div>' +
+      '<div class="admin-bar"><button class="btn btn-bad btn-sm" data-act="delBooking">🗑 Delete booking ' + esc(c.bookingNo) + ' (made by mistake)</button></div>';
+  }
   return h;
 }
 
@@ -560,29 +706,53 @@ function bulkSiblings(c, step) {
 }
 function actionCard(c, s) {
   if (!s.cur || c.status !== 'ACTIVE') return '';
-  const step = DEF.steps[s.cur - 1];
+  const step = DEF.byN[s.cur], only1 = step.n === 1; // step 1 open = older container still missing its cut-offs
   if (!can(step.key)) {
     const who = assignees(step.key);
-    return '<div class="act wait"><div class="act-h"><h4><span class="snum">' + step.n + '</span>Waiting on: ' + esc(step.name) + '</h4>' + dueChip(s.due) + '</div>' +
+    return '<div class="act wait"><div class="act-h"><h4><span class="snum">' + step.no + '</span>Waiting on: ' + esc(step.name) + '</h4>' + dueChip(s.due) + '</div>' +
       '<div class="callee">Responsible: ' + (who.length ? who.map(callee).join(', ') : '<b style="color:var(--bad)">nobody assigned</b>') + '</div></div>';
   }
   const pre = S.stash[c.id + ':' + step.n] || {};
   const sibs = bulkSiblings(c, step);
-  const fields = step.fields.map(k => {
+  const fields = (only1 ? DEF.byN[4].moved : step.fields).map(k => {
     let v = pre[k];
     if (v === undefined && k === 'gateInDate') v = Date.now();
-    return inputFor(k, v);
+    return inputFor(k, v, true);
   }).join('');
-  return '<form class="act ' + (s.over ? 'bad' : '') + '" data-form="step" data-n="' + step.n + '"><div class="act-h"><h4><span class="snum' + (s.over ? ' bad' : '') + '">' + step.n + '</span>' + esc(step.name) + '</h4>' + dueChip(s.due) + '</div>' +
+  return '<form class="act ' + (s.over ? 'bad' : '') + '" data-form="step" data-n="' + step.n + '"><div class="act-h"><h4><span class="snum' + (s.over ? ' bad' : '') + '">' + step.no + '</span>' + esc(step.name) + (only1 ? ' — S.I & Gate-In cut-offs' : '') + '</h4>' + dueChip(s.due) + '</div>' +
     '<div class="form-grid">' + fields + '</div>' +
     '<div class="act-foot">' + (sibs.length ? '<label class="chk"><input type="checkbox" name="_bulk" checked> Also apply to the other ' + sibs.length + ' container' + (sibs.length > 1 ? 's' : '') + ' of this booking at this step</label>' : '<span></span>') +
-    '<button class="btn btn-dark">' + (step.mark ? '✓ Mark as done' : 'Save & complete step') + '</button></div></form>';
+    '<button class="btn btn-dark">' + (step.mark ? '✓ Mark as done' : only1 ? 'Save cut-offs' : 'Save & complete step') + '</button></div></form>';
 }
 
-function inputFor(k, val) {
+/* Future-only date + time: native date (past days greyed) + hour/minute selects whose past options are disabled.
+   The hidden input carries the combined value, so readForm() is unchanged. */
+function earliestSlot() { const d = new Date(Math.ceil((Date.now() + 60000) / 3e5) * 3e5); return d; } // next 5-min mark
+function dtInput(k, val, req) {
+  const v = val ? new Date(+val) : null;
+  const hours = Array.from({ length: 24 }, (_, h) => '<option value="' + h + '"' + (v && v.getHours() === h ? ' selected' : '') + '>' + ((h % 12) || 12) + (h < 12 ? ' AM' : ' PM') + '</option>').join('');
+  const mins = Array.from({ length: 12 }, (_, i) => '<option value="' + i * 5 + '"' + (v && Math.floor(v.getMinutes() / 5) === i ? ' selected' : '') + '>:' + pad(i * 5) + '</option>').join('');
+  return '<div class="dt" data-dt><input class="inp" type="date" value="' + (v ? toInput(+val, 'date') : '') + '" min="' + toInput(earliestSlot().getTime(), 'date') + '"' + req + '>' +
+    '<select class="inp"' + req + '><option value="">Hour</option>' + hours + '</select><select class="inp"' + req + '><option value="">Min</option>' + mins + '</select>' +
+    '<input type="hidden" name="' + k + '"></div>';
+}
+function syncDt(box) {
+  const [d, h, m] = box.querySelectorAll('input[type=date], select'), hid = box.querySelector('input[type=hidden]');
+  const e = earliestSlot(), firstDay = toInput(e.getTime(), 'date'), eh = e.getHours(), em = e.getMinutes();
+  if (d.value && d.value < firstDay) d.value = firstDay; // typed a past day → nearest allowed day
+  const onFirst = d.value === firstDay;
+  [...h.options].forEach(o => { o.disabled = o.value !== '' && onFirst && +o.value < eh; });
+  if (h.selectedOptions[0] && h.selectedOptions[0].disabled) h.value = String(eh);
+  [...m.options].forEach(o => { o.disabled = o.value !== '' && onFirst && +h.value === eh && +o.value < em; });
+  if (m.selectedOptions[0] && m.selectedOptions[0].disabled) m.value = String(em);
+  hid.value = d.value && h.value !== '' && m.value !== '' ? d.value + 'T' + pad(h.value) + ':' + pad(m.value) : '';
+}
+function inputFor(k, val, future) { // future: step forms — picker greys out the past, browser blocks typed past values
+
   const f = DEF.fields[k], req = f.req ? ' required' : '';
   let inp;
-  if (f.t === 'date' || f.t === 'datetime') inp = '<input class="inp" type="' + (f.t === 'date' ? 'date' : 'datetime-local') + '" name="' + k + '" value="' + toInput(val, f.t) + '"' + req + '>';
+  if (f.t === 'datetime' && future && !f.past) inp = dtInput(k, val, req);
+  else if (f.t === 'date' || f.t === 'datetime') inp = '<input class="inp" type="' + (f.t === 'date' ? 'date' : 'datetime-local') + '" name="' + k + '" value="' + toInput(val, f.t) + '"' + req + (future && !f.past ? ' min="' + toInput(Date.now(), f.t) + '"' : '') + '>';
   else if (f.t === 'select') inp = '<select class="inp" name="' + k + '"' + req + '><option value="">Select…</option>' + DEF.locations.map(o => '<option' + (o === val ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>';
   else if (f.t === 'textarea') inp = '<textarea class="inp" name="' + k + '" rows="2">' + esc(val || '') + '</textarea>';
   else if (f.t === 'money') inp = '<input class="inp mono" type="number" step="0.01" min="0" inputmode="decimal" name="' + k + '" value="' + (isEmpty(val) ? '' : esc(val)) + '" placeholder="₹ 0">';
@@ -617,7 +787,7 @@ function diff(c, vals) {
 function sectionAttrs(c, keys) {
   return '<div class="attr-grid">' + keys.map(k => {
     const p = pendAppr(c.id, k);
-    return '<div class="attr"><div class="k">' + esc(DEF.fields[k].l) + '</div><div class="v' + (isEmpty(c[k]) ? ' e' : '') + '">' + valHtml(k, c[k]) + '</div>' +
+    return '<div class="attr"><div class="k">' + esc(DEF.fields[k].l) + (DEF.fields[k].must ? ' <i style="color:var(--bad);font-style:normal">*</i>' : '') + '</div><div class="v' + (isEmpty(c[k]) ? ' e' : '') + '">' + valHtml(k, c[k]) + '</div>' +
       (p ? '<div class="pendchg">⏳ pending: ' + esc(fmtV(k, p.newValue)) + '</div>' : '') + '</div>';
   }).join('') + '</div>';
 }
@@ -629,53 +799,65 @@ function tabSection(c, key) {
     return h + '<form class="act" data-form="section" data-k="' + key + '"><div class="form-grid">' + sec.fields.map(k => inputFor(k, c[k]).replace(' required', '')).join('') +
       '</div><div class="act-foot"><span class="hint">Changing an already-filled value needs admin approval.</span><span><button type="button" class="btn btn-ghost" data-act="cancelEdit">Cancel</button> <button class="btn btn-dark">Save</button></span></div></form>';
   }
-  const filled = sec.fields.filter(k => !isEmpty(c[k])).length;
-  h += '<div class="card-h" style="margin-bottom:10px"><span class="sub">' + filled + ' of ' + sec.fields.length + ' filled</span>' + (ed ? '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="' + key + '">✎ Edit details</button>' : '') + '</div>';
+  const must = sec.fields.filter(k => DEF.fields[k].must), left = must.filter(k => isEmpty(c[k])).length, x = st(c).extra.find(e => e.k === key);
+  h += '<div class="card-h" style="margin-bottom:10px"><span class="sub" style="display:inline">' + (!must.length ? '' : !left ? '<span class="badge b-done">Required details complete ✓</span>' :
+      x ? left + ' required field' + (left > 1 ? 's' : '') + ' left ' + dueChip(x.due) : '<span class="badge b-queued">* required after gate-in</span>') + '</span>' +
+    (ed ? '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="' + key + '">✎ Edit details</button>' : '') + '</div>';
   return h + sectionAttrs(c, sec.fields);
 }
 function tabDocs(c, s) {
-  const ed = can('DOCS') && editable(c), keys = ['sbNo', 'blNo'];
+  const ed = can('DOCS') && editable(c), keys = ['sbNo', 'invoiceNo', 'blNo'];
   const done = c.sbNo && c.sbPhoto && c.blNo && c.blPhoto;
-  let h = '<div class="dr-sec-t">Shipping Bill & BL<span>' + (done ? '<span class="badge b-done">Complete ✓</span>' : s.docsNeeded ? dueChip(s.docsDue) : '<span class="badge b-queued">Required after dispatch</span>') + '</span></div>';
+  let h = '<div class="dr-sec-t">Invoice, SB & BL<span>' + (done ? '<span class="badge b-done">Complete ✓</span>' : s.docsNeeded ? dueChip(s.docsDue) : '<span class="badge b-queued">Required after gate-in</span>') + '</span></div>';
   if (S.edit === 'DOCS') {
     h += '<form class="act" data-form="section" data-k="DOCS"><div class="form-grid">' + keys.map(k => inputFor(k, c[k]).replace(' required', '')).join('') +
       '</div><div class="act-foot"><span></span><span><button type="button" class="btn btn-ghost" data-act="cancelEdit">Cancel</button> <button class="btn btn-dark">Save numbers</button></span></div></form>';
   }
   h += '<div class="cgrp">';
-  [['sbNo', 'sbPhoto', 'Shipping Bill'], ['blNo', 'blPhoto', 'Bill of Lading (BL)']].forEach(x => {
+  [['sbNo', 'sbPhoto', 'Shipping Bill'], ['invoiceNo', 'invPhoto', 'Invoice'], ['blNo', 'blPhoto', 'Bill of Lading (BL)']].forEach(x => {
     const p = pendAppr(c.id, x[0]);
     h += '<div class="crow"><div class="l">' + x[2] + ' No.<div class="' + (c[x[0]] ? 'amt' : 'amt e') + '" style="margin-top:3px">' + esc(c[x[0]] || 'not entered') + '</div>' + (p ? '<span class="pendchg">⏳ ' + esc(p.newValue) + '</span>' : '') + '</div>' +
       '<div class="tl-time">Photo</div>' + slot(c, x[1], ed) + '</div>';
   });
   h += '</div>';
-  if (ed && S.edit !== 'DOCS') h += '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="DOCS">✎ ' + (c.sbNo || c.blNo ? 'Edit numbers' : 'Enter SB / BL numbers') + '</button>';
+  if (ed && S.edit !== 'DOCS') h += '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="DOCS">✎ ' + (c.sbNo || c.blNo || c.invoiceNo ? 'Edit numbers' : 'Enter numbers') + '</button>';
   if (c.docs_at) h += '<p class="tl-time" style="margin-top:12px">Completed ' + fmtDT(c.docs_at) + ' by ' + esc(c.docs_by || '') + '</p>';
   return h;
 }
-function chargeTotal(c) {
-  let t = 0;
-  DEF.chargeGroups.forEach(g => g.items.forEach(it => { t += Number(c[it[0]]) || 0; }));
-  for (let i = 1; i <= DEF.extraSlots; i++) t += Number(c['ex' + i + '_amt']) || 0;
-  return t;
-}
+// Each amount has its own currency; amounts saved before currencies existed were entered as ₹.
+const curOf = (c, k) => c[k + '_cur'] || 'INR';
+const fmtCur = (v, cur) => cur === 'USD' ? '$ ' + Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 2 }) : '₹ ' + Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+function sumCur(c, keys) { const t = { USD: 0, INR: 0 }; keys.forEach(k => { if (!isEmpty(c[k])) t[curOf(c, k)] += Number(c[k]) || 0; }); return t; }
+const bothCur = t => fmtCur(t.USD, 'USD') + ' | ' + fmtCur(t.INR, 'INR');
+const someCur = t => ['USD', 'INR'].filter(k => t[k]).map(k => fmtCur(t[k], k)).join(' | ');
+const EX_KEYS = Array.from({ length: DEF.extraSlots }, (_, i) => 'ex' + (i + 1) + '_amt');
+function chargeTotal(c) { return sumCur(c, DEF.chargeGroups.flatMap(g => g.items.map(it => it[0])).concat(EX_KEYS)); }
 function tabCharges(c) {
   const ed = can('CHARGES') && editable(c), editing = S.edit === 'CHARGES';
-  let h = '<div class="grand"><span><span class="eyebrow" style="color:#A9A597">Total detention & extra cost</span></span><b>' + money(chargeTotal(c)) + '</b></div>';
+  let h = '<div class="grand"><span><span class="eyebrow" style="color:#A9A597">Total detention & extra cost</span></span><b>' + bothCur(chargeTotal(c)) + '</b></div>';
+  // "no extra charges": only the assigned person, only while nothing is logged
+  const anyAmt = DEF.moneyKeys.some(k => !isEmpty(c[k])), cx = st(c).extra.find(x => x.k === 'CHARGES');
+  if (!anyAmt && c.chg_none_at) h += '<div class="act wait"><b style="color:var(--ok)">✓ No extra charges on this container</b><div class="tl-time">Marked by ' + esc(c.chg_none_by) + ' · ' + fmtDT(c.chg_none_at) + '</div></div>';
+  else if (!anyAmt) h += '<div class="act ' + (cx ? (cx.over ? 'bad' : '') : 'wait') + '"><div class="act-h"><h4>' + (cx ? 'Charges must be addressed' : 'Charges open after Actual Arrival Date') + '</h4>' + (cx ? dueChip(cx.due) : '') + '</div>' +
+    '<div class="tl-time" style="margin-bottom:10px">Log any charge below, or confirm there are none.</div>' +
+    (can('CHARGES') && c.status === 'ACTIVE' ? '<button class="btn btn-ok" data-act="noCharges">✓ No extra charges on this container</button>' : '<div class="callee">Responsible: ' + (assignees('CHARGES').map(callee).join(', ') || '—') + '</div>') + '</div>';
   h += '<div class="card-h" style="margin-bottom:10px"><span class="sub">' + (ed ? 'Photos upload instantly. Amounts: edit, then Save.' : 'Owner: ' + (assignees('CHARGES').map(u => esc(u.name)).join(', ') || '—')) + '</span>' +
     (ed && !editing ? '<button class="btn btn-dark btn-sm" data-act="editSec" data-k="CHARGES">✎ Edit amounts</button>' : '') + '</div>';
   if (editing) h += '<form data-form="section" data-k="CHARGES">';
   const amt = k => {
     const p = pendAppr(c.id, k);
-    return editing ? '<input class="inp mono" type="number" step="0.01" min="0" inputmode="decimal" name="' + k + '" value="' + (isEmpty(c[k]) ? '' : c[k]) + '" placeholder="0">'
-      : '<div class="amt' + (isEmpty(c[k]) ? ' e' : '') + '">' + (isEmpty(c[k]) ? '—' : money(c[k])) + (p ? '<div class="pendchg">⏳ ' + esc(fmtV(k, p.newValue)) + '</div>' : '') + '</div>';
+    const cur = c[k + '_cur'] || (isEmpty(c[k]) ? 'USD' : 'INR'), pc = pendAppr(c.id, k + '_cur');
+    return editing ? '<span class="amtc"><select class="inp cur" name="' + k + '_cur"><option value="USD"' + (cur === 'USD' ? ' selected' : '') + '>$ USD</option><option value="INR"' + (cur === 'INR' ? ' selected' : '') + '>₹ INR</option></select>' +
+        '<input class="inp mono" type="number" step="0.01" min="0" inputmode="decimal" name="' + k + '" value="' + (isEmpty(c[k]) ? '' : c[k]) + '" placeholder="0"></span>'
+      : '<div class="amt' + (isEmpty(c[k]) ? ' e' : '') + '">' + (isEmpty(c[k]) ? '—' : fmtCur(c[k], curOf(c, k))) +
+        (p || pc ? '<div class="pendchg">⏳ ' + esc(fmtCur(p ? p.newValue : c[k], pc ? pc.newValue : curOf(c, k))) + '</div>' : '') + '</div>';
   };
   DEF.chargeGroups.forEach(g => {
-    let sub = 0; g.items.forEach(it => sub += Number(c[it[0]]) || 0);
-    h += '<div class="cgrp"><div class="cgrp-h"><span>' + esc(g.name) + '</span><span class="tot">' + (sub ? money(sub) : '') + '</span></div>' +
+    const sub = someCur(sumCur(c, g.items.map(it => it[0])));
+    h += '<div class="cgrp"><div class="cgrp-h"><span>' + esc(g.name) + '</span><span class="tot">' + sub + '</span></div>' +
       g.items.map(it => '<div class="crow"><div class="l">' + esc(it[1]) + '</div>' + amt(it[0]) + '<div class="slots">' + slot(c, it[0] + '_p1', ed) + slot(c, it[0] + '_p2', ed) + '</div></div>').join('') + '</div>';
   });
-  let xs = 0; for (let i = 1; i <= DEF.extraSlots; i++) xs += Number(c['ex' + i + '_amt']) || 0;
-  h += '<div class="cgrp"><div class="cgrp-h"><span>Extra expenses (not listed above)</span><span class="tot">' + (xs ? money(xs) : '') + '</span></div>';
+  h += '<div class="cgrp"><div class="cgrp-h"><span>Extra expenses (not listed above)</span><span class="tot">' + someCur(sumCur(c, EX_KEYS)) + '</span></div>';
   for (let i = 1; i <= DEF.extraSlots; i++) {
     const d = 'ex' + i + '_desc', a = 'ex' + i + '_amt';
     if (!editing && isEmpty(c[d]) && isEmpty(c[a]) && isEmpty(c['ex' + i + '_p1']) && !ed) continue;
@@ -703,6 +885,12 @@ function tabHist(c) {
   if (!H || H.at !== c.updatedAt) loadHist(c.id);
   const aps = S.approvals.filter(a => a.containerId === c.id);
   let h = '';
+  if (isPC()) {
+    loadFu();
+    const fus = (S.fu || []).filter(f => f.containerId === c.id).sort((a, b) => b.createdAt - a.createdAt);
+    h += '<div class="dr-sec-t">PC follow-ups<span style="text-transform:none;letter-spacing:0;font-weight:500">admin & PC only</span></div>' +
+      (!S.fu ? '<div class="empty"><span class="spin"></span></div>' : fus.length ? fus.map(fuCard).join('') : '<div class="empty">No follow-ups logged yet.</div>');
+  }
   if (aps.length) h += '<div class="dr-sec-t">Change requests</div>' + aps.map(apprCard).join('');
   h += '<div class="dr-sec-t">Full history<span style="text-transform:none;letter-spacing:0;font-weight:500">visible to everyone</span></div>';
   if (!H) return h + '<div class="empty"><span class="spin"></span></div>';
@@ -741,8 +929,8 @@ async function optimistic(ids, mutate, call) {
 }
 
 async function submitStep(form) {
-  const n = +form.dataset.n, step = DEF.steps[n - 1], c = S.C.get(S.open);
-  const vals = readForm(form, step.fields);
+  const n = +form.dataset.n, step = DEF.byN[n], c = S.C.get(S.open);
+  const vals = readForm(form, n === 1 ? DEF.byN[4].moved : step.fields);
   if (!vals) return;
   if (vals.containerNo && !/^[A-Z]{4}\d{7}$/.test(vals.containerNo) && !(await confirmBox('“' + vals.containerNo + '” does not look like a standard container number (4 letters + 7 digits). Save anyway?'))) return;
   const bulk = !!(form.elements._bulk && form.elements._bulk.checked);
@@ -752,7 +940,8 @@ async function submitStep(form) {
   const mutate = o => {
     const due = ctDue(o, n, S.rules);
     Object.keys(vals).forEach(k => { if (isEmpty(vals[k])) delete o[k]; else o[k] = vals[k]; });
-    o['s' + n + '_at'] = now; o['s' + n + '_by'] = S.me.name; if (due) o['s' + n + '_due'] = due;
+    const at = n === 1 ? 4 : n; // late cut-offs → old step-4 slot (same as server)
+    o['s' + at + '_at'] = now; o['s' + at + '_by'] = S.me.name; if (due) o['s' + at + '_due'] = due;
   };
   try {
     let r = await optimistic(ids, mutate, () => api('completeStep', S.token, c.id, n, vals, bulk, false));
@@ -761,7 +950,7 @@ async function submitStep(form) {
       r = await optimistic(ids, mutate, () => api('completeStep', S.token, c.id, n, vals, bulk, true));
     }
     delete S.stash[key];
-    toast('✓ ' + step.short + ' done' + (ids.length > 1 ? ' for ' + ids.length + ' containers' : ''), 'ok');
+    toast('✓ ' + (n === 1 ? 'Cut-offs saved' : step.short + ' done') + (ids.length > 1 ? ' for ' + ids.length + ' containers' : ''), 'ok');
     kickNotify();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -826,13 +1015,13 @@ async function prepFile(file) {
 
 /* ================================================================ modals: booking, edit, profile, password */
 function bookingModal() {
-  modal('<form data-form="booking"><h2>New booking</h2><p class="msub">One booking splits into one pipeline per container.</p><div class="form-grid">' +
-    DEF.steps[0].fields.map(k => inputFor(k, k === 'numContainers' ? 1 : '')).join('') +
+  modal('<form data-form="booking"><h2>New booking</h2><p class="msub">One booking splits into one pipeline per container. S.I & gate-in cut-offs apply to all of them.</p><div class="form-grid">' +
+    DEF.byN[1].fields.map(k => inputFor(k, k === 'numContainers' ? 1 : '', true)).join('') +
     '</div><div class="note">Timestamp is recorded automatically. Users assigned to <b>Container Allotment Date</b> are notified on Telegram.</div>' +
     '<div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">Create booking</button></div></form>');
 }
 async function submitBooking(form, force) {
-  const vals = readForm(form, DEF.steps[0].fields);
+  const vals = readForm(form, DEF.byN[1].fields);
   if (!vals) return;
   const btn = form.querySelector('button:not([type=button])'); busy(btn, true);
   try {
@@ -850,10 +1039,10 @@ async function submitBooking(form, force) {
   } catch (e) { busy(btn, false); toast(e.message, 'err'); }
 }
 function editStepModal(n) {
-  const c = S.C.get(S.open), step = DEF.steps[n - 1];
+  const c = S.C.get(S.open), step = DEF.byN[n];
   const keys = step.fields.filter(k => !DEF.fields[k].ro);
   modal('<form data-form="editFields" data-keys="' + keys.join(',') + '"><h2>Edit — ' + esc(step.name) + '</h2><p class="msub">' +
-    (isAdmin() ? 'Admin edits apply immediately.' : 'Empty fields save directly; changing a filled value goes to admin for approval.') + (n === 1 ? ' Booking details apply to every container in this booking.' : '') + '</p>' +
+    (isAdmin() ? 'Admin edits apply immediately.' : 'Empty fields save directly; changing a filled value goes to admin for approval.') + (n === 1 ? ' Booking details (incl. S.I & gate-in cut-offs) apply to every container in this booking.' : '') + '</p>' +
     '<div class="form-grid">' + keys.map(k => inputFor(k, c[k]).replace(' required', '')).join('') + '</div>' +
     '<div class="modal-foot"><button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button><button class="btn btn-dark">Save changes</button></div></form>', 'wide');
 }
@@ -874,7 +1063,7 @@ function pwModal(forced) {
     '<div class="modal-foot">' + (forced ? '<button type="button" class="btn btn-ghost" data-act="logout">Sign out</button>' : '<button type="button" class="btn btn-ghost" data-act="mCancel">Cancel</button>') + '<button class="btn btn-dark">Save password</button></div></form>', '', forced);
 }
 function stepLabel(k) {
-  if (/^S\d+$/.test(k)) return k + ' · ' + DEF.steps[+k.slice(1) - 1].name;
+  if (/^S\d+$/.test(k)) { const s = DEF.byN[+k.slice(1)]; return s.gone ? s.name + ' (old step, now part of Booking Details)' : 'Step ' + s.no + ' · ' + s.name; }
   const s = DEF.sections.find(x => x.key === k); return s ? s.name : k;
 }
 
@@ -907,9 +1096,9 @@ function computeAn() {
     if (c.s7_at >= mS) A.dispThis++; else if (c.s7_at >= lmS && c.s7_at < mS) A.dispLast++;
     if (c.status === 'ACTIVE') A.active++;
     if (c.status === 'CLOSED' && inR(c.statusAt)) A.closed++;
-    let delayed = s.over || s.docsOver || s.late > 0;
-    for (let n = 2; n <= 10; n++) {
-      const at = c['s' + n + '_at'], due = c['s' + n + '_due'], prev = c['s' + (n - 1) + '_at'];
+    let delayed = s.anyOver || s.late > 0;
+    for (const step of DEF.flow.slice(1)) {
+      const n = step.n, at = c['s' + n + '_at'], due = c['s' + n + '_due'], prev = ctPrevAt(c, n);
       if (!inR(at)) continue;
       const p = P('S' + n);
       if (prev) { p.hrs += (at - prev) / 3600e3; p.cnt++; }
@@ -917,12 +1106,13 @@ function computeAn() {
       A.stepsTotal++;
       if (at > due) { A.stepsLate++; p.late++; U(c['s' + n + '_by'] || '?').late++; } else p.ok++;
     }
-    if (c.docs_at && c.s7_at && inR(c.docs_at)) {
-      const p = P('DOCS'); p.hrs += (c.docs_at - c.s7_at) / 3600e3; p.cnt++; A.stepsTotal++;
-      if (c.docs_at > c.s7_at + docsH) { A.stepsLate++; p.late++; U(c.docs_by || '?').late++; delayed = true; } else p.ok++;
+    const docsFrom = c.s10_at || c.s7_at; // SB & BL opens at gate-in (older files: dispatch)
+    if (c.docs_at && docsFrom && inR(c.docs_at)) {
+      const p = P('DOCS'); p.hrs += Math.max(0, c.docs_at - docsFrom) / 3600e3; p.cnt++; A.stepsTotal++;
+      if (c.docs_at > docsFrom + docsH) { A.stepsLate++; p.late++; U(c.docs_by || '?').late++; delayed = true; } else p.ok++;
     }
     if (c.status === 'ACTIVE') {
-      [[s.over, 'S' + s.cur], [s.docsOver, 'DOCS']].forEach(x => {
+      [[s.over, 'S' + s.cur]].concat(s.extra.map(e => [e.over, e.k])).forEach(x => {
         if (!x[0]) return;
         A.overNow++; P(x[1]).over++;
         const who = assignees(x[1]); (who.length ? who : [{ name: 'Unassigned' }]).forEach(u => U(u.name).over++);
@@ -938,6 +1128,7 @@ function computeAn() {
   return A;
 }
 function vAn() {
+  loadArchive(); // month/year stats need the old files too; re-renders when they arrive
   const A = computeAn(), a = S.an;
   const diffP = A.dispLast ? Math.round((A.dispThis - A.dispLast) / A.dispLast * 100) : null;
   const onTime = A.stepsTotal ? Math.round((1 - A.stepsLate / A.stepsTotal) * 100) : null;
@@ -971,8 +1162,8 @@ async function drawCharts() {
   C.defaults.font.family = 'Inter, system-ui, sans-serif'; C.defaults.color = '#6C685D'; C.defaults.borderColor = '#E8E3D6';
   const base = (extra) => Object.assign({ responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { boxWidth: 10, boxHeight: 10, usePointStyle: true } } } }, extra || {});
   const mk = (id, cfg) => { const el = document.getElementById(id); if (el) S.charts.push(new C(el, cfg)); };
-  const stepKeys = DEF.steps.slice(1).map(s => 'S' + s.n).concat(['DOCS']);
-  const stepLbl = k => k === 'DOCS' ? 'SB/BL' : DEF.steps[+k.slice(1) - 1].short;
+  const stepKeys = DEF.flow.slice(1).map(s => 'S' + s.n).concat(Object.keys(DEF.side));
+  const stepLbl = k => DEF.side[k] ? { DOCS: 'Inv/SB/BL', TRACK: 'Tracking', CHARGES: 'Charges' }[k] : DEF.byN[+k.slice(1)].short;
   mk('ch1', { type: 'bar', data: { labels: A.months.map(m => m.l), datasets: [{ label: 'Dispatched', data: A.months.map(m => m.disp), backgroundColor: '#F2C14E', borderRadius: 8 }] }, options: base({ plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }) });
   mk('ch2', { type: 'bar', data: { labels: A.months.map(m => m.l), datasets: [{ label: 'On time', data: A.months.map(m => m.ok), backgroundColor: '#4F9D69', borderRadius: 6 }, { label: 'Delayed', data: A.months.map(m => m.late), backgroundColor: '#CF4F33', borderRadius: 6 }] }, options: base({ scales: { x: { stacked: true }, y: { stacked: true, ticks: { precision: 0 } } } }) });
   const users = Object.keys(A.byUser).sort((a, b) => (A.byUser[b].late + A.byUser[b].over) - (A.byUser[a].late + A.byUser[a].over)).slice(0, 10);
@@ -987,7 +1178,7 @@ async function drawCharts() {
     const ids = Object.keys(uid), name = id => (S.users.find(u => u.id === id) || { name: id }).name;
     mk('ch6', { type: 'line', data: { labels: V.map(x => x.d.slice(8) + ' ' + MON[+x.d.slice(5, 7) - 1]), datasets: ids.map((id, i) => ({ label: name(id), data: V.map(x => x.v[id] || 0), borderColor: PAL[i % PAL.length], backgroundColor: PAL[i % PAL.length], tension: .3, pointRadius: 2 })) }, options: base({ scales: { y: { ticks: { precision: 0 }, beginAtZero: true } } }) });
     const rows = ids.map(id => { const tot = V.reduce((s, x) => s + (x.v[id] || 0), 0); return [name(id), (tot / V.length).toFixed(1), V[V.length - 1].v[id] || 0, tot]; }).sort((a, b) => b[3] - a[3]);
-    const el = $('#visTbl'); if (el) el.innerHTML = '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>User</th><th>Avg / day</th><th>Today</th><th>14 days</th></tr></thead><tbody>' + rows.map(r => '<tr><td>' + esc(r[0]) + '</td><td class="mono">' + r[1] + '</td><td class="mono">' + r[2] + '</td><td class="mono">' + r[3] + '</td></tr>').join('') + '</tbody></table></div>';
+    const el = $('#visTbl'); if (el) el.innerHTML = '<div class="tbl-wrap"><table class="tbl cards"><thead><tr><th>User</th><th>Avg / day</th><th>Today</th><th>14 days</th></tr></thead><tbody>' + rows.map(r => '<tr><td data-l="User"><b>' + esc(r[0]) + '</b></td><td data-l="Avg / day" class="mono">' + r[1] + '</td><td data-l="Today" class="mono">' + r[2] + '</td><td data-l="14 days" class="mono">' + r[3] + '</td></tr>').join('') + '</tbody></table></div>';
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -1003,10 +1194,10 @@ function vAdmin() {
 }
 function admUsers() {
   const us = S.adm.users;
-  return '<div class="card"><div class="card-h"><h3>Users (' + us.length + ')</h3><button class="btn btn-amber btn-sm" data-act="userEdit">+ Add user</button></div><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Mobile</th><th>Telegram</th><th>Steps</th><th>Status</th></tr></thead><tbody>' +
-    us.map(u => '<tr class="click" data-act="userEdit" data-id="' + u.id + '"><td><b>' + esc(u.name) + '</b></td><td class="mono">' + esc(u.username) + '</td><td>' + esc(DEF.roles[u.role]) + '</td><td class="mono">' + esc(u.mobile || '—') + '</td>' +
-      '<td>' + (u.telegramChatId ? '<span class="badge b-done">linked</span>' : '<span class="badge b-queued">no</span>') + '</td><td><div class="chips">' + (u.role === 'admin' ? '<span class="chip">all</span>' : u.steps.map(s => '<span class="chip">' + esc(s) + '</span>').join('') || '—') + '</div></td>' +
-      '<td>' + (u.active ? '<span class="badge b-done">active</span>' : '<span class="badge b-halt">disabled</span>') + (u.mustChange ? ' <span class="badge b-warn">temp pw</span>' : '') + '</td></tr>').join('') + '</tbody></table></div></div>';
+  return '<div class="card"><div class="card-h"><h3>Users (' + us.length + ')</h3><button class="btn btn-amber btn-sm" data-act="userEdit">+ Add user</button></div><div class="tbl-wrap"><table class="tbl cards"><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Mobile</th><th>Telegram</th><th>Steps</th><th>Status</th></tr></thead><tbody>' +
+    us.map(u => '<tr class="click" data-act="userEdit" data-id="' + u.id + '"><td data-l="Name"><b>' + esc(u.name) + '</b></td><td data-l="Username" class="mono">' + esc(u.username) + '</td><td data-l="Role">' + esc(DEF.roles[u.role]) + '</td><td data-l="Mobile" class="mono">' + esc(u.mobile || '—') + '</td>' +
+      '<td data-l="Telegram">' + (u.telegramChatId ? '<span class="badge b-done">linked</span>' : '<span class="badge b-queued">no</span>') + '</td><td data-l="Steps"><div class="chips">' + (u.role === 'admin' ? '<span class="chip">all</span>' : u.steps.map(s => '<span class="chip">' + esc(s) + '</span>').join('') || '—') + '</div></td>' +
+      '<td data-l="Status">' + (u.active ? '<span class="badge b-done">active</span>' : '<span class="badge b-halt">disabled</span>') + (u.mustChange ? ' <span class="badge b-warn">temp pw</span>' : '') + '</td></tr>').join('') + '</tbody></table></div></div>';
 }
 function userModal(id) {
   const u = id ? S.adm.users.find(x => x.id === id) : { role: 'user', active: true, steps: [] };
@@ -1023,12 +1214,12 @@ function userModal(id) {
 }
 function admWorkflow() {
   const R = S.adm.rules, people = S.adm.users.filter(u => u.active && u.role !== 'admin');
-  const srcOpts = (k, r) => '<option value="after"' + (r.src === 'after' ? ' selected' : '') + '>' + (k === 'DOCS' ? 'Hours after dispatch (step 7)' : 'Hours after previous step is done') + '</option>' +
-    (k === 'DOCS' ? '' : DEF.deadlineFields.map(f => '<option value="field:' + f + '"' + (r.src === 'field' && r.field === f ? ' selected' : '') + '>Date: ' + esc(DEF.fields[f].l) + '</option>').join(''));
+  const srcOpts = (k, r) => '<option value="after"' + (r.src === 'after' ? ' selected' : '') + '>' + ({ DOCS: 'Hours after gate-in (step 9)', TRACK: 'Hours after gate-in (step 9)', CHARGES: 'Hours after Actual Arrival Date' }[k] || 'Hours after previous step is done') + '</option>' +
+    (DEF.side[k] ? '' : DEF.deadlineFields.map(f => '<option value="field:' + f + '"' + (r.src === 'field' && r.field === f ? ' selected' : '') + '>Date: ' + esc(DEF.fields[f].l) + '</option>').join(''));
   let h = '<form class="card" data-form="rules"><div class="card-h"><div><h3>Steps, deadlines & who does them</h3><span class="sub">Tap a name to assign / unassign instantly. Deadline changes apply after “Save deadlines”.</span></div><button class="btn btn-dark btn-sm">Save deadlines</button></div>';
   DEF.stepKeys.forEach(k => {
-    const r = R[k];
-    h += '<div class="wf-row"><div class="wf-name">' + esc(stepLabel(k)) + '<small>' + (k === 'S1' ? 'Creates the booking — no deadline' : r ? '' : 'Maintained until file is closed — no deadline') + '</small></div><div>' +
+    const r = k === 'S1' ? null : R[k]; // S1 rule only chases older containers missing their details
+    h += '<div class="wf-row"><div class="wf-name">' + esc(stepLabel(k)) + '<small>' + (k === 'S1' ? 'Creates the booking with its S.I & gate-in cut-offs — no deadline' : r ? '' : 'Maintained until file is closed — no deadline') + '</small></div><div>' +
       (r ? '<div class="wf-rule"><select class="inp" name="src_' + k + '">' + srcOpts(k, r) + '</select><input class="inp mono" type="number" step="0.5" name="hrs_' + k + '" value="' + (r.hours || 0) + '"><span class="hint">hours ' + (r.src === 'field' ? '(+/- offset from that date)' : '') + '</span></div>' : '') +
       '<div class="chips">' + people.map(u => '<button type="button" class="pill-t' + (u.steps.indexOf(k) >= 0 ? ' on' : '') + '" data-act="assign" data-k="' + k + '" data-u="' + u.id + '">' + esc(u.name) + '</button>').join('') + '</div></div></div>';
   });
@@ -1075,6 +1266,7 @@ const ACT = {
   railGo: el => { S.lf.tab = 'ACTIVE'; S.lf.step = el.dataset.k; LS.set('ct_lf', S.lf); go('list'); },
   lf: el => { S.lf[el.dataset.k] = el.dataset.k === 'group' ? !!el.dataset.v : el.dataset.v; S.limit = 120; LS.set('ct_lf', S.lf); renderView(); },
   lfClear: () => { S.lf = { tab: S.lf.tab, from: '', to: '', step: '', group: S.lf.group, sort: S.lf.sort }; LS.set('ct_lf', S.lf); $('#q').value = ''; onSearch(); },
+  fopen: () => { S.fopen = !S.fopen; renderView(); },
   moreList: () => { S.limit += 200; renderView(); },
   editStep: el => editStepModal(+el.dataset.n),
   editSec: el => { S.edit = el.dataset.k; renderDrawer(); },
@@ -1138,13 +1330,41 @@ const ACT = {
     const ids = S.adm.users.filter(u => u.steps.indexOf(k) >= 0).map(u => u.id);
     const want = ids.indexOf(uid) >= 0 ? ids.filter(x => x !== uid) : ids.concat([uid]);
     el.classList.toggle('on');
-    try { S.adm = await api('setStepAssignees', S.token, k, want); syncUsersFromAdm(); toast('Assignment saved', 'ok'); }
+    try { S.adm = await api('setStepAssignees', S.token, k, want); syncUsersFromAdm(); kickNotify(); toast('Assignment saved', 'ok'); }
     catch (e) { el.classList.toggle('on'); toast(e.message, 'err'); }
   },
   runCheck: async el => { busy(el, true); try { const r = await api('adminRunCheck', S.token); toast('Checked: ' + r.alerts + ' alert group(s), ' + r.sent + ' message(s) sent', 'ok'); } catch (e) { toast(e.message, 'err'); } busy(el, false); },
   triggers: async el => { busy(el, true); try { S.adm = await api('adminInstallTriggers', S.token); renderView(); toast('Scheduler installed ✓', 'ok'); } catch (e) { busy(el, false); toast(e.message, 'err'); } },
   clearCache: async el => { busy(el, true); try { await api('adminClearCache', S.token); S.since = 0; await doSync(); toast('Reloaded from sheet ✓', 'ok'); } catch (e) { toast(e.message, 'err'); } busy(el, false); },
-  anPreset: el => { S.an.preset = el.dataset.v; renderView(); }
+  anPreset: el => { S.an.preset = el.dataset.v; renderView(); },
+  delBooking: async el => {
+    const c = S.C.get(S.open), n = Array.from(S.C.values()).filter(o => o.bookingId === c.bookingId).length;
+    const typed = await promptBox('Delete booking ' + c.bookingNo + '?', 'This permanently removes all ' + n + ' container(s) of this booking from the sheet for everyone. History stays in the Log sheet. Type the booking number to confirm:', c.bookingNo, { input: true, ok: 'Delete permanently' });
+    if (typed === null) return;
+    busy(el, true);
+    try {
+      const r = await api('deleteBooking', S.token, c.bookingId, typed);
+      r.deleted.forEach(id => S.C.delete(id)); persist();
+      closeDrawer(true); refresh();
+      toast('Booking ' + c.bookingNo + ' deleted (' + r.deleted.length + ' container' + (r.deleted.length > 1 ? 's' : '') + ')', 'ok');
+    } catch (e) { busy(el, false); toast(e.message, 'err'); }
+  },
+  noCharges: async el => {
+    if (!(await confirmBox('Confirm there are no extra charges on ' + label(S.C.get(S.open)) + '? This closes the Charges task.', 'Yes, no extra charges'))) return;
+    busy(el, true);
+    try { const r = await api('markNoCharges', S.token, S.open); applyContainers(r.containers); refresh(); toast('Marked: no extra charges ✓', 'ok'); }
+    catch (e) { busy(el, false); toast(e.message, 'err'); }
+  },
+  fu: (el, e) => { e.preventDefault(); e.stopPropagation(); fuModal(el.dataset.id, el.dataset.k); },
+  fuPreset: el => { S.fuf.preset = el.dataset.v; renderView(); },
+  ntTab: el => { S.ntTab = el.dataset.v; renderView(); },
+  ntEdit: el => { S.nEdit = el.dataset.id; renderView(); window.scrollTo({ top: 0, behavior: 'smooth' }); },
+  ntCancel: () => { S.nEdit = null; renderView(); },
+  ntStop: async el => {
+    if (!(await confirmBox('Stop this notification? It moves to Completed and will not be sent again.', 'Stop', true))) return;
+    try { S.nts = await api('stopNotice', S.token, el.dataset.id); if (S.nEdit === el.dataset.id) S.nEdit = null; renderView(); toast('Stopped', 'ok'); }
+    catch (e) { toast(e.message, 'err'); }
+  }
 };
 function syncUsersFromAdm() {
   S.users = S.adm.users.map(u => ({ id: u.id, username: u.username, name: u.name, role: u.role, mobile: u.mobile, steps: u.steps, active: u.active, tg: !!u.telegramChatId }));
@@ -1156,6 +1376,40 @@ const FORMS = {
   step: f => submitStep(f),
   booking: f => submitBooking(f),
   prompt: f => { const v = String(f.elements.v.value || '').trim(); if (!v) { f.elements.v.classList.add('err'); return; } resolveModal(v); },
+  nt: async f => {
+    const E = f.elements, d = { id: S.nEdit || '', toId: E.to.value, kind: E.kind.value, text: E.text.value.trim() };
+    if (!d.toId) return toast('Pick who to notify', 'err');
+    if (!d.text) { E.text.focus(); return toast('Type the message', 'err'); }
+    if (d.kind === 'scheduled') { d.at = fromInput(E.at.value, 'datetime'); if (!d.at || d.at < Date.now()) return toast('Pick a future date & time', 'err'); }
+    if (d.kind === 'auto') {
+      d.freq = E.freq.value; d.time = E.time.value; d.dom = +E.dom.value; d.days = $$('input[name=days]:checked', f).map(x => +x.value);
+      if (!d.time) return toast('Pick a time', 'err');
+      if (d.freq === 'weekly' && !d.days.length) return toast('Pick at least one day', 'err');
+    }
+    const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
+    try {
+      S.nts = await api('saveNotice', S.token, d);
+      const wasEdit = !!S.nEdit; S.nEdit = null; S.ntTab = d.kind === 'direct' ? 'done' : 'active';
+      renderView();
+      toast(d.kind === 'direct' ? 'Sent ✓' : wasEdit ? 'Changes saved ✓' : d.kind === 'scheduled' ? 'Scheduled for ' + fmtShort(d.at) : 'Auto-reminder started ✓', 'ok');
+    } catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  },
+  fu: async f => {
+    const E = f.elements, d = { containerId: f.dataset.id, step: E.step.value, person: E.person.value, said: E.said.value.trim() };
+    if (!d.said) { E.said.classList.add('err'); E.said.focus(); return toast('Write what they said', 'err'); }
+    if (E.rem.checked) {
+      d.remindAt = fromInput(E.at.value, 'datetime'); d.remindText = E.todo.value.trim();
+      if (!d.remindAt || !d.remindText) return toast('Fill the reminder time and what you have to do', 'err');
+    }
+    const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
+    try {
+      const r = await api('logFollowup', S.token, d);
+      if (S.fu) S.fu.push(r);
+      if (d.remindAt) S.rems = null;
+      closeModal(true); refresh();
+      toast('Follow-up logged' + (d.remindAt ? ' · reminder set for ' + fmtShort(d.remindAt) : ''), 'ok');
+    } catch (e) { busy(btn, false); toast(e.message, 'err'); }
+  },
   editFields: async f => {
     const c = S.C.get(S.open), keys = f.dataset.keys.split(',');
     const vals = readForm(f, keys, true); if (!vals) return;
@@ -1165,8 +1419,9 @@ const FORMS = {
   },
   section: async f => {
     const c = S.C.get(S.open), k = f.dataset.k;
-    const keys = k === 'CHARGES' ? Array.from(f.elements).map(e => e.name).filter(n => n && DEF.fields[n]) : k === 'DOCS' ? ['sbNo', 'blNo'] : DEF.sections.find(s => s.key === k).fields;
+    const keys = k === 'CHARGES' ? Array.from(f.elements).map(e => e.name).filter(n => n && DEF.fields[n]) : k === 'DOCS' ? ['sbNo', 'invoiceNo', 'blNo'] : DEF.sections.find(s => s.key === k).fields;
     const vals = readForm(f, keys, true); if (!vals) return;
+    Object.keys(vals).forEach(n => { if (/_cur$/.test(n) && isEmpty(vals[n.slice(0, -4)])) delete vals[n]; }); // no currency without an amount
     const ch = diff(c, vals);
     S.edit = null; S.dirty = false;
     const ok = await submitChanges(c.id, ch);
@@ -1194,7 +1449,7 @@ const FORMS = {
       password: f.elements.password.value.trim(), telegramChatId: f.elements.telegramChatId.value, active: f.elements.active.checked,
       steps: $$('input[name=steps]:checked', f).map(x => x.value) };
     const btn = f.querySelector('button:not([type=button])'); busy(btn, true);
-    try { S.adm = await api('saveUserAdmin', S.token, d); closeModal(true); syncUsersFromAdm(); toast('User saved ✓', 'ok'); }
+    try { S.adm = await api('saveUserAdmin', S.token, d); closeModal(true); syncUsersFromAdm(); kickNotify(); toast('User saved ✓', 'ok'); }
     catch (e) { busy(btn, false); toast(e.message, 'err'); }
   },
   rules: async f => {
@@ -1221,7 +1476,7 @@ function onSearch() {
   const v = $('#q').value;
   S.q = v.trim(); S.qTerms = S.q.toLowerCase().split(/\s+/).filter(Boolean);
   $('#qx').hidden = !S.q; S.limit = 120;
-  if (['dash', 'list', 'appr'].indexOf(S.view) < 0) { S.view = 'list'; renderNav(); }
+  if (['dash', 'list', 'appr', 'fu'].indexOf(S.view) < 0) { S.view = 'list'; renderNav(); }
   cancelAnimationFrame(_qt); _qt = requestAnimationFrame(renderView);
 }
 
@@ -1243,8 +1498,12 @@ function bindEvents() {
   document.addEventListener('change', e => {
     const t = e.target;
     if (t.matches('input[type=file][data-up]')) { uploadTo(S.open, t.dataset.up, t.files[0]); t.value = ''; return; }
+    if (t.closest('[data-dt]')) { syncDt(t.closest('[data-dt]')); return; }
+    if (t.type === 'date' && t.min && t.value && t.value < t.min) t.value = t.min; // typed a past day → today
     if (t.dataset.lf) { S.lf[t.dataset.lf] = t.value; S.limit = 120; LS.set('ct_lf', S.lf); renderView(); return; }
     if (t.dataset.an) { S.an[t.dataset.an] = t.value; renderView(); }
+    if (t.dataset.fuf) { S.fuf[t.dataset.fuf] = t.value; renderView(); }
+    if (t.name === 'step' && t.form && t.form.dataset.form === 'fu') t.form.elements.person.innerHTML = personOpts(t.value); // people assigned to the chosen step
   });
   document.addEventListener('input', e => { if (e.target.closest('#drawer form')) S.dirty = true; });
   document.addEventListener('error', e => {
@@ -1268,7 +1527,7 @@ async function doLogin(f) {
   try {
     const r = await api('login', f.elements.u.value, f.elements.p.value);
     S.token = r.token; LS.set('ct_token', r.token);
-    S.view = 'dash'; LS.set('ct_view', 'dash'); S.adm = null; S.rems = null; S.visits = null; S.hist = {};
+    S.view = 'dash'; LS.set('ct_view', 'dash'); S.adm = null; S.rems = null; S.visits = null; S.hist = {}; S.fu = null;
     ingest(r.boot); showApp(); render(); postBoot();
     f.reset();
   } catch (e) { err.textContent = e.message; err.hidden = false; }
@@ -1281,7 +1540,8 @@ async function doSync(manual) {
     const p = await api('sync', S.token, S.since);
     const changed = ingest(p);
     S.lastSync = Date.now(); setSync('live');
-    refresh(true);
+    // re-render only on new data (or every ~5 min so due chips age); idle polls no longer reset open pickers
+    if (changed || manual || (S.tick = (S.tick || 0) + 1) % 6 === 0) refresh(true); else renderNav();
     if (manual) toast(changed ? 'Updated' : 'Already up to date');
   } catch (e) { setSync('off'); if (manual) toast(e.message, 'err'); }
   finally { S.syncing = 0; }

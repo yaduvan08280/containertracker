@@ -5,7 +5,7 @@
 <meta charset="UTF-8">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 <?!= include('Styles'); ?>
 </head>
 <body>
@@ -54,8 +54,8 @@
   <main class="main">
     <div class="topbar">
       <div class="hello">
-        <button class="menu-btn" data-act="menu" aria-label="Menu">&#9776;</button>
         <div><h1 id="pageTitle">Dashboard</h1><p id="pageSub"></p></div>
+        <button class="m-me" data-act="profile" id="mMe" aria-label="Profile"></button>
       </div>
       <div class="topbar-actions">
         <div class="search">
@@ -68,6 +68,8 @@
     </div>
     <div id="view"></div>
   </main>
+  <nav class="bnav" id="bnav"></nav>
+  <button class="fab" data-act="newBooking" id="fab" aria-label="New booking" hidden>+</button>
 </div>
 
 <div class="scrim" id="scrim" data-act="closeDrawer"></div>

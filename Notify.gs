@@ -68,9 +68,9 @@ function assignees_(stepKey) {
   return loadUsers_().filter(function (u) { return u.active && u.steps.indexOf(stepKey) >= 0; });
 }
 function stepName_(stepKey) {
-  if (stepKey === 'DOCS') return 'Shipping Bill & BL upload';
+  if (DEF.side[stepKey]) return DEF.side[stepKey][1];
   var n = Number(stepKey.slice(1));
-  return DEF.steps[n - 1].name;
+  return DEF.byN[n].name;
 }
 function bookingLine_(c) {
   return 'Booking <b>' + escH_(c.bookingNo) + '</b> · ' + escH_(c.party || '') + (c.line ? ' · ' + escH_(c.line) : '') + (c.vessel ? ' / ' + escH_(c.vessel) : '');
@@ -79,6 +79,8 @@ function contList_(cs) {
   var names = cs.map(function (c) { return c.containerNo ? '<code>' + escH_(c.containerNo) + '</code>' : '#' + c.seq; });
   return (cs.length > 1 ? 'Containers (' + cs.length + '): ' : 'Container: ') + names.join(', ');
 }
+/** The open follow-on task `k` (DOCS / TRACK / CHARGES) of a state, or undefined. */
+function sideOf_(s, k) { return s.extra.filter(function (x) { return x.k === k; })[0]; }
 function openLink_(c) { var u = appUrl_(); return u ? '\n<a href="' + u + '?c=' + c.id + '">Open in Container Tracker</a>' : ''; }
 
 /** "New task" message to everyone assigned to stepKey, grouped per booking. */
@@ -88,11 +90,34 @@ function queueTask_(stepKey, cs) {
   var rules = getRules_(), now = Date.now(), groups = {};
   cs.forEach(function (c) { (groups[c.bookingId] = groups[c.bookingId] || []).push(c); });
   Object.keys(groups).forEach(function (b) {
-    var g = groups[b], dues = g.map(function (c) { var s = ctState(c, rules, now); return stepKey === 'DOCS' ? s.docsDue : s.due; }).filter(Boolean);
+    var g = groups[b], dues = g.map(function (c) { var s = ctState(c, rules, now); return DEF.side[stepKey] ? (sideOf_(s, stepKey) || {}).due : s.due; }).filter(Boolean);
     var due = dues.length ? Math.min.apply(null, dues) : null;
     var text = '🔔 <b>New task — ' + escH_(stepName_(stepKey)) + '</b>\n' + bookingLine_(g[0]) + '\n' + contList_(g) +
       '\n⏰ Deadline: <b>' + (due ? fmtT_(due) : 'waiting for date') + '</b>' + openLink_(g[0]);
     who.forEach(function (u) { queueMsg_(u.telegramChatId, text); });
+  });
+}
+
+/** Someone was just given steps → tell them what is already waiting there (overdue first). */
+function queueAssigned_(u, keys) {
+  if (!u.active || !u.telegramChatId || !keys.length) return;
+  var rules = getRules_(), now = Date.now();
+  keys.forEach(function (k) {
+    var items = [];
+    loadContainers_().forEach(function (c) {
+      if (c.status !== 'ACTIVE') return;
+      var s = ctState(c, rules, now), x = DEF.side[k] ? sideOf_(s, k) : null;
+      if (x) items.push({ c: c, due: x.due });
+      else if (!DEF.side[k] && s.cur === Number(k.slice(1))) items.push({ c: c, due: s.due });
+    });
+    items.sort(function (a, b) { return (a.due || 9e15) - (b.due || 9e15); });
+    var text = '📌 <b>New step assigned to you — ' + escH_(stepName_(k)) + '</b>\n' +
+      (items.length ? items.length + ' container(s) waiting:\n' + items.slice(0, 15).map(function (i) {
+        return '• ' + (i.c.containerNo ? '<code>' + escH_(i.c.containerNo) + '</code>' : '#' + i.c.seq) + ' · ' + escH_(i.c.bookingNo) + ' — ' +
+          (!i.due ? 'awaiting date' : now > i.due ? '⚠️ <b>overdue ' + dur_(now - i.due) + '</b>' : 'due in <b>' + dur_(i.due - now) + '</b>');
+      }).join('\n') + (items.length > 15 ? '\n…and ' + (items.length - 15) + ' more' : '') + openLink_(items[0].c)
+        : 'Nothing is waiting at this step right now.');
+    queueMsg_(u.telegramChatId, text);
   });
 }
 
@@ -116,6 +141,7 @@ function cronTick(manual) {
   var quiet = s.quietStart !== s.quietEnd && (s.quietStart > s.quietEnd ? (hour >= s.quietStart || hour < s.quietEnd) : (hour >= s.quietStart && hour < s.quietEnd));
   if (!quiet || manual === true) out.alerts = checkDeadlines_(now, s);
   out.reminders = checkReminders_(now);
+  out.notices = checkNotices_(now);
   out.sent = flushQueue_();
   if (hour === 3) { try { pruneVisits_(); } catch (e) {} }
   return out;
@@ -133,8 +159,11 @@ function checkDeadlines_(now, s) {
     alive['NF_' + c.id] = 1;
     var st = ctState(c, rules, now), key = 'NF_' + c.id, state, dirty = false;
     try { state = JSON.parse(props[key] || '{}'); } catch (e) { state = {}; }
-    function check(stepKey, due, tag) {
+    function check(stepKey, due, tag, openedAt) {
       if (!due) return;
+      if (now < due && due - now <= 3600000 && state['p' + tag] !== due) { // PC heads-up 1h before
+        push('pc1h', stepKey, due, c, openedAt); state['p' + tag] = due; dirty = true;
+      }
       if (now < due && due - now <= remindMs && state['r' + tag] !== due) {
         push('remind', stepKey, due, c); state['r' + tag] = due; dirty = true;
       }
@@ -142,26 +171,31 @@ function checkDeadlines_(now, s) {
         push('over', stepKey, due, c); state['o' + tag] = now; dirty = true;
       }
     }
-    if (st.cur) check('S' + st.cur, st.due, String(st.cur));
-    if (st.docsNeeded) check('DOCS', st.docsDue, 'D');
+    if (st.cur) check('S' + st.cur, st.due, String(st.cur), ctPrevAt(c, st.cur));
+    st.extra.forEach(function (x) { check(x.k, x.due, DEF.side[x.k][2], x.from); }); // SB & BL, tracking, charges
     if (dirty) upd[key] = JSON.stringify(state);
   });
-  function push(type, stepKey, due, c) {
+  function push(type, stepKey, due, c, openedAt) {
     var k = type + '|' + stepKey + '|' + c.bookingId;
-    (events[k] = events[k] || { type: type, stepKey: stepKey, due: due, cs: [] }).cs.push(c);
-    events[k].due = Math.min(events[k].due, due);
+    var ev = (events[k] = events[k] || { type: type, stepKey: stepKey, due: due, cs: [], opened: openedAt || 0 });
+    ev.cs.push(c); ev.due = Math.min(ev.due, due);
+    if (openedAt) ev.opened = ev.opened ? Math.min(ev.opened, openedAt) : openedAt;
   }
 
   var n = 0;
   Object.keys(events).forEach(function (k) {
     var ev = events[k], c0 = ev.cs[0], who = assignees_(ev.stepKey), name = stepName_(ev.stepKey);
-    if (ev.type === 'remind') {
+    var call = who.length ? who.map(function (u) { return '• ' + escH_(u.name) + ' — ' + (u.mobile ? '<b>' + escH_(u.mobile) + '</b>' : '<i>no mobile saved</i>'); }).join('\n')
+      : '⚠️ Nobody is assigned to this step — assign someone in Admin ▸ Workflow.';
+    if (ev.type === 'pc1h') {
+      var pcm = '⏳ <b>Due in ' + dur_(ev.due - now) + ' — not done yet</b>\nStep: <b>' + escH_(name) + '</b>\n' + bookingLine_(c0) + '\n' + contList_(ev.cs) +
+        '\nAssigned since: ' + (ev.opened ? fmtT_(ev.opened) : '—') + ' · deadline ' + fmtT_(ev.due) + '\n📞 Responsible:\n' + call + openLink_(c0);
+      loadUsers_().filter(function (u) { return u.active && u.role === 'pc' && u.telegramChatId; }).forEach(function (u) { queueMsg_(u.telegramChatId, pcm); });
+    } else if (ev.type === 'remind') {
       var t = '⏰ <b>Reminder — ' + escH_(name) + '</b>\n' + bookingLine_(c0) + '\n' + contList_(ev.cs) +
         '\nDue in <b>' + dur_(ev.due - now) + '</b> (' + fmtT_(ev.due) + ')' + openLink_(c0);
       who.forEach(function (u) { if (u.telegramChatId) queueMsg_(u.telegramChatId, t); });
     } else {
-      var call = who.length ? who.map(function (u) { return '• ' + escH_(u.name) + ' — ' + (u.mobile ? '<b>' + escH_(u.mobile) + '</b>' : '<i>no mobile saved</i>'); }).join('\n')
-        : '⚠️ Nobody is assigned to this step — assign someone in Admin ▸ Workflow.';
       var alert = '🚨 <b>DELAY — follow-up needed</b>\nStep: <b>' + escH_(name) + '</b>\n' + bookingLine_(c0) + '\n' + contList_(ev.cs) +
         '\nDeadline: ' + fmtT_(ev.due) + ' · <b>overdue by ' + dur_(now - ev.due) + '</b>\n📞 Please call:\n' + call + openLink_(c0);
       watchers.forEach(function (u) { queueMsg_(u.telegramChatId, alert); });
@@ -233,6 +267,46 @@ function pollTelegram_() {
     });
     P.setProperty('TG_OFFSET', String(off));
     return linked;
+  } finally { l.releaseLock(); }
+}
+
+/* ================================================================ notices: direct / scheduled / auto-reminders */
+
+function noticeText_(n) {
+  return '📣 <b>' + (n.byRole === 'admin' ? 'ADMIN' : 'Process Coordinator') + '</b> : "' + escH_(n.text) + '"';
+}
+
+/** Next send time after `from` for an auto-reminder (script timezone). Monthly on the 31st → last day of short months. */
+function nextAt_(n, from) {
+  var hm = String(n.time).split(':'), days = String(n.days).split(',').filter(String).map(Number);
+  var d = new Date(from);
+  for (var i = 0; i < 400; i++, d.setDate(d.getDate() + 1)) {
+    d.setHours(+hm[0], +hm[1], 0, 0);
+    if (d.getTime() <= from) continue;
+    var last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    if (n.freq === 'daily' || (n.freq === 'weekly' && days.indexOf(d.getDay()) >= 0) || (n.freq === 'monthly' && d.getDate() === Math.min(Number(n.dom), last))) return d.getTime();
+  }
+  return 0;
+}
+
+/** Scheduler: send due scheduled / auto notices. */
+function checkNotices_(now) {
+  if (!loadNotices_().some(function (n) { return n.active && n.at && n.at <= now; })) return 0;
+  var l = LockService.getScriptLock();
+  if (!l.tryLock(20000)) return 0;
+  try {
+    cacheDrop_('N'); _users = null;
+    var sent = 0;
+    loadNotices_().forEach(function (n) {
+      if (!n.active || !n.at || n.at > now) return;
+      var to = userById_(n.toId);
+      if (to && to.active && to.telegramChatId) { queueMsg_(to.telegramChatId, noticeText_(n)); n.note = ''; sent++; }
+      else n.note = 'Not delivered — ' + (to ? to.name + ' has no Telegram linked' : 'user removed');
+      n.lastSent = now; n.sentCount = (n.sentCount || 0) + 1;
+      if (n.kind === 'auto') n.at = nextAt_(n, now); else n.active = false;
+      saveNotice_(n);
+    });
+    return sent;
   } finally { l.releaseLock(); }
 }
 

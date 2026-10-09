@@ -5,7 +5,7 @@
  * and the cache in the same locked operation so readers never hit the sheet twice.
  */
 
-var SH = { C: 'Containers', U: 'Users', A: 'Approvals', L: 'Log', G: 'Config' };
+var SH = { C: 'Containers', U: 'Users', A: 'Approvals', L: 'Log', G: 'Config', F: 'Followups', N: 'Notices' };
 var CACHE_TTL = 21600; // 6h (max)
 var CHUNK = 90000;
 var TZ = Session.getScriptTimeZone() || 'Asia/Kolkata';
@@ -40,9 +40,11 @@ function containerCols_() {
   });
   DEF.sections.forEach(function (s) { s.fields.forEach(function (k) { add(k, F[k].l, kindOf(k)); }); });
   add('docs_at', 'Docs Completed At', 'd'); add('docs_by', 'Docs Completed By', 's');
+  add('chg_none_at', 'No Extra Charges — Marked At', 'd'); add('chg_none_by', 'No Extra Charges — Marked By', 's');
   DEF.chargeGroups.forEach(function (g) {
     g.items.forEach(function (it) {
       add(it[0], g.name + ' › ' + it[1], 'n');
+      add(it[0] + '_cur', g.name + ' › ' + it[1] + ' — Currency', 's');
       add(it[0] + '_p1', g.name + ' › ' + it[1] + ' — Photo 1', 's');
       add(it[0] + '_p2', g.name + ' › ' + it[1] + ' — Photo 2', 's');
     });
@@ -50,6 +52,7 @@ function containerCols_() {
   for (var i = 1; i <= DEF.extraSlots; i++) {
     add('ex' + i + '_desc', 'Extra Expense ' + i + ' — Description', 's');
     add('ex' + i + '_amt', 'Extra Expense ' + i + ' — Amount', 'n');
+    add('ex' + i + '_amt_cur', 'Extra Expense ' + i + ' — Currency', 's');
     add('ex' + i + '_p1', 'Extra Expense ' + i + ' — Photo 1', 's');
     add('ex' + i + '_p2', 'Extra Expense ' + i + ' — Photo 2', 's');
   }
@@ -142,15 +145,41 @@ function rowOf_(o, hdr) {
   });
 }
 
+/**
+ * Before writing, look up each record's real row by its ID in column A. Rows shift if someone deletes,
+ * inserts or sorts rows by hand; trusting a cached row number would overwrite a different record.
+ * One read of column A per save. A record whose ID is gone was deleted → refuse and make every app reload.
+ */
+function fixRows_(sh, objs) {
+  objs = objs.filter(function (o) { return o._r; });
+  if (!objs.length) return;
+  var last = sh.getLastRow(), at = {};
+  if (last >= 2) sh.getRange(2, 1, last - 1, 1).getValues().forEach(function (r, i) { if (r[0] !== '') at[String(r[0])] = i + 2; });
+  objs.forEach(function (o) {
+    if (at[o.id]) { o._r = at[o.id]; return; }
+    reloadAll_();
+    throw new Error('“' + (o.containerNo || o.id) + '” was removed from the sheet. The app is reloading its data — refresh and try again.');
+  });
+}
+
+/** Drop every server copy and make every phone take a full fresh copy on its next sync. */
+function reloadAll_() {
+  CacheService.getScriptCache().removeAll(['C', 'U', 'G', 'A', 'F', 'N']);
+  _list = null; _users = null; _cfg = null;
+  var now = String(Date.now());
+  PropertiesService.getScriptProperties().setProperties({ VER: now, FULL: now });
+}
+
 /** Persist changed containers (new ones have no _r). Must be called inside a lock. */
 function saveContainers_(changed) {
   if (!changed.length) return;
   var sh = sheet_(SH.C), hdr = headerKeys_(sh), now = Date.now();
+  fixRows_(sh, changed);
   var existing = [], fresh = [];
   changed.forEach(function (c) {
     c.updatedAt = now;
     var st = ctState(c, getRules_(), now);
-    c.stage = c.status && c.status !== 'ACTIVE' ? c.status : (st.cur ? st.cur + ' · ' + DEF.steps[st.cur - 1].name : 'Pipeline complete');
+    c.stage = c.status && c.status !== 'ACTIVE' ? c.status : (st.cur ? DEF.byN[st.cur].no + ' · ' + DEF.byN[st.cur].name : 'Pipeline complete');
     (c._r ? existing : fresh).push(c);
   });
   // group contiguous rows into single setValues calls
@@ -205,6 +234,7 @@ function saveUser_(u) {
     if (k === 'createdAt' && typeof u[k] === 'number') return new Date(u[k]);
     return u[k] === undefined ? '' : u[k];
   });
+  fixRows_(sh, [u]);
   if (u._r) sh.getRange(u._r, 1, 1, row.length).setValues([row]);
   else { u._r = Math.max(sh.getLastRow(), 1) + 1; sh.getRange(u._r, 1, 1, row.length).setValues([row]); loadUsers_().push(u); }
   cachePut_('U', loadUsers_());
@@ -294,6 +324,7 @@ function saveApproval_(a) {
     if ((k === 'createdAt' || k === 'decidedAt') && v) return new Date(v);
     return v === undefined ? '' : v;
   });
+  fixRows_(sh, [a]);
   if (a._r) {
     sh.getRange(a._r, 1, 1, row.length).setValues([row]);
     for (var i = 0; i < list.length; i++) if (list[i].id === a.id) list[i] = a;
@@ -304,6 +335,63 @@ function saveApproval_(a) {
   }
   cachePut_('A', list);
   bumpVersion_();
+}
+
+/* ---------------------------------------------------------------- PC follow-ups */
+
+var FU_COLS = ['id', 'createdAt', 'byId', 'byName', 'containerId', 'bookingNo', 'containerLabel', 'step', 'person', 'said', 'remindAt', 'remindText'];
+// ponytail: whole sheet cached as one list; fine for years of follow-ups, page it if it passes ~20k rows
+function loadFollowups_() {
+  var cached = cacheGet_('F');
+  if (cached) return cached;
+  var sh = sheet_(SH.F), last = sh.getLastRow(), out = [];
+  if (last >= 2) sh.getRange(2, 1, last - 1, FU_COLS.length).getValues().forEach(function (row) {
+    if (!row[0]) return;
+    var f = {};
+    FU_COLS.forEach(function (k, j) { f[k] = row[j] instanceof Date ? row[j].getTime() : row[j]; });
+    out.push(f);
+  });
+  cachePut_('F', out);
+  return out;
+}
+function addFollowup_(f) {
+  var sh = sheet_(SH.F), list = loadFollowups_();
+  sh.appendRow(FU_COLS.map(function (k) { return (k === 'createdAt' || k === 'remindAt') && f[k] ? new Date(f[k]) : f[k]; }));
+  list.push(f);
+  cachePut_('F', list);
+}
+
+/* ---------------------------------------------------------------- notices (PC / admin → user Telegram) */
+
+var NT_COLS = ['id', 'createdAt', 'byId', 'byName', 'byRole', 'toId', 'toName', 'kind', 'text', 'freq', 'days', 'dom', 'time', 'at', 'active', 'lastSent', 'sentCount', 'note'];
+function loadNotices_() {
+  var cached = cacheGet_('N');
+  if (cached) return cached;
+  var sh = sheet_(SH.N), last = sh.getLastRow(), out = [];
+  if (last >= 2) sh.getRange(2, 1, last - 1, NT_COLS.length).getValues().forEach(function (row, i) {
+    if (!row[0]) return;
+    var n = { _r: i + 2 };
+    NT_COLS.forEach(function (k, j) { n[k] = row[j] instanceof Date ? row[j].getTime() : row[j]; });
+    n.active = n.active === true || String(n.active).toUpperCase() === 'TRUE';
+    n.days = String(n.days || ''); n.time = String(n.time || ''); n.dom = Number(n.dom) || ''; n.sentCount = Number(n.sentCount) || 0;
+    out.push(n);
+  });
+  cachePut_('N', out);
+  return out;
+}
+function saveNotice_(n) {
+  var sh = sheet_(SH.N), list = loadNotices_();
+  var row = NT_COLS.map(function (k) { var v = n[k]; return (k === 'createdAt' || k === 'at' || k === 'lastSent') && v ? new Date(v) : (v === undefined ? '' : v); });
+  fixRows_(sh, [n]);
+  if (n._r) {
+    sh.getRange(n._r, 1, 1, row.length).setValues([row]);
+    for (var i = 0; i < list.length; i++) if (list[i].id === n.id) list[i] = n;
+  } else {
+    n._r = Math.max(sh.getLastRow(), 1) + 1;
+    sh.getRange(n._r, 1, 1, row.length).setValues([row]);
+    list.push(n);
+  }
+  cachePut_('N', list);
 }
 
 /* ---------------------------------------------------------------- log */
@@ -325,7 +413,7 @@ function fmtVal_(v, key) {
     var t = DEF.fields[key].t;
     if (t === 'date') return Utilities.formatDate(new Date(Number(v)), TZ, 'dd MMM yyyy');
     if (t === 'datetime') return Utilities.formatDate(new Date(Number(v)), TZ, 'dd MMM yyyy HH:mm');
-    if (t === 'money') return '₹ ' + Number(v).toLocaleString('en-IN');
+    if (t === 'money') return Number(v).toLocaleString('en-IN'); // currency is its own field now
   }
   return String(v);
 }
