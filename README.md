@@ -37,7 +37,7 @@ Every account must set its own password at first sign-in.
 | User | Username | Temporary password | Role | Assigned to |
 |---|---|---|---|---|
 | Admin | `admin` | `Admin@123` | Admin | Everything |
-| PC01 | `pc01` | `Pc01@123` | Process Coordinator | Steps 1–10 (reassign in Admin ▸ Workflow) |
+| PC01 | `pc01` | `Pc01@123` | Process Coordinator | Steps 1–9 (reassign in Admin ▸ Workflow) |
 | Harish Ji | `harish` | `Harish@123` | User | Shipment Tracking (ETD, BL date, ETA, Arrival, ISF, Filing, DO, Clearance, Arrival Notice) |
 | Kuldeep Ji | `kuldeep` | `Kuldeep@123` | User | Charges & Expenses |
 | Dhruv Ji | `dhruv` | `Dhruv@123` | User | Shipping Bill & BL (number + photo) |
@@ -64,19 +64,19 @@ Admin can change every deadline in **Admin ▸ Workflow & deadlines**. A deadlin
 
 | # | Step | Default deadline |
 |---|---|---|
-| 1 | Booking Details (Booking No., Line, Vessel, Party, Destination, No. of containers). Creates one pipeline per container. | — |
+| 1 | Booking Details (Booking No., Line, Vessel, Party, Destination, No. of containers) **plus S.I Cut-off, Receiving/Handover Location and Gate-In Cut-off** for the whole booking. Creates one pipeline per container. | — |
 | 2 | Container Allotment Date | 24 h after booking |
-| 3 | Container Allotment Details (Arrival date, Container No., Invoice No.) | the Allotment Date (end of day) |
-| 4 | S.I & Gate-In Cut-offs + Receiving/Handover location | 24 h after step 3 |
-| 5 | S.I Submission (mark done + remarks) | S.I Cut-off Date |
-| 6 | Container Departure Date (Factory) | 24 h after step 5 |
-| 7 | Stuffing / Dispatch (Est. reaching date, driver no., vehicle no., remark) | Departure Date |
-| 8 | All Clearance Documents Preparation | 2 h after step 7 |
-| 9 | All Clearance Documents Submission | 2 h after step 8 |
-| 10 | Container Gate-In | Gate-In Cut-off Date |
-| — | Shipping Bill & BL (mandatory after dispatch) | 24 h after step 7 |
+| 3 | Container Allotment Details (Arrival date, Container No., Invoice No. optional) | the Allotment Date (end of day) |
+| 4 | S.I Submission (mark done + remarks) | S.I Cut-off Date |
+| 5 | Container Departure Date (Factory) | 24 h after step 4 |
+| 6 | Stuffing / Dispatch (Est. reaching date; driver no. and vehicle no. optional) | Departure Date |
+| 7 | All Clearance Documents Preparation | 2 h after step 6 |
+| 8 | All Clearance Documents Submission | 2 h after step 7 |
+| 9 | Container Gate-In | Gate-In Cut-off Date |
 
-For steps 2, 4 and 6, one tick on the form applies the same values to every container of that booking that is waiting at the same step.
+The old "S.I & Gate-In Cut-offs" step was merged into Booking Details. Its data and history stay in the same sheet columns. A container created before the merge that is still missing its cut-offs shows **Booking Details — S.I & Gate-In cut-offs** as its open step, with old step 4's deadline (24 h after its previous step).
+
+For steps 2 and 5, one tick on the form applies the same values to every container of that booking that is waiting at the same step.
 
 ## Rules built in
 
@@ -111,3 +111,5 @@ Don't rename the header row or reorder columns by hand. Editing values by hand i
 - **Tracking fields:** ETD, BL Date, ETA, Actual Arrival and Filing Date are dates. ISF, DO, Clearance and Arrival Notice are free text, so a status or number can be written in them.
 - **Step 7's estimated reaching date** is recorded and shown, but step 8's deadline follows your explicit "2 hours after step 7" rule. If you want it to use the estimated date instead, change it in Admin ▸ Workflow.
 
+#   n e w d a y f i t n e s s  
+ 
